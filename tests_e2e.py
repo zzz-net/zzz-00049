@@ -5,6 +5,8 @@ import shutil
 import tempfile
 import io
 import json
+import csv
+from typing import Tuple, List, Dict, Any, Optional
 from contextlib import redirect_stdout
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -375,7 +377,8 @@ def test_cli_rich_output():
                               "-s", "confirmed", "-r", "tester_alice", "-n", "测试备注"])
         check("mark confirmed", r)
 
-        r = runner.invoke(cli, ["rollback", "-b", batch_id, "-d", first_disp_id])
+        r = runner.invoke(cli, ["rollback", "-b", batch_id, "-d", first_disp_id,
+                              "-r", "tester_alice"])
         check("rollback", r)
 
         out_csv = os.path.join(tmpdir, "cli_test.csv")
@@ -553,7 +556,8 @@ def test_audit_cli_integration():
                               "-s", "confirmed", "-r", "audit_tester", "-n", "审计测试"])
         check("mark confirmed", r)
 
-        r = runner.invoke(cli, ["rollback", "-b", batch_id, "-d", first_disp_id])
+        r = runner.invoke(cli, ["rollback", "-b", batch_id, "-d", first_disp_id,
+                              "-r", "audit_tester"])
         check("rollback", r)
 
         audit = AuditStorage(tmpdir)
@@ -925,7 +929,8 @@ def test_close_block_mark_rollback_match():
         assert "禁止标记" in r.output, f"mark 应被禁止, 输出: {r.output}"
         print("  关闭后 mark 被拒绝: OK")
 
-        r = runner.invoke(cli, ["rollback", "-b", batch_id, "-d", first_disp_id])
+        r = runner.invoke(cli, ["rollback", "-b", batch_id, "-d", first_disp_id,
+                              "-r", "closed_tester"])
         check("rollback while closed (应被拒)", r, expected_exit=1)
         assert "禁止回滚" in r.output, f"rollback 应被禁止, 输出: {r.output}"
         print("  关闭后 rollback 被拒绝: OK")
@@ -965,7 +970,8 @@ def test_close_block_mark_rollback_match():
         assert disp_final.reviewer == "reopen_tester"
         print("  reopen 后 mark 正常工作: OK")
 
-        r = runner.invoke(cli, ["rollback", "-b", batch_id, "-d", first_disp_id])
+        r = runner.invoke(cli, ["rollback", "-b", batch_id, "-d", first_disp_id,
+                              "-r", "reopen_tester"])
         check("rollback after reopen (应成功)", r)
         print("  reopen 后 rollback 正常工作: OK")
 
@@ -2048,7 +2054,8 @@ def test_archive_write_block():
         assert "禁止标记" in r.output
         print("  [OK] 归档后 mark 被拒绝")
 
-        r = runner.invoke(cli, ["rollback", "-b", batch_id, "-d", first_disp_id])
+        r = runner.invoke(cli, ["rollback", "-b", batch_id, "-d", first_disp_id,
+                              "-r", "archived_tester"])
         check("rollback while archived (应被拒)", r, expected_exit=1)
         assert "禁止回滚" in r.output
         print("  [OK] 归档后 rollback 被拒绝")
@@ -2856,6 +2863,7 @@ def test_schedule_cli_commands():
     import tempfile
     import shutil
     import os
+    import traceback
     from datetime import datetime, timedelta
 
     tmpdir = tempfile.mkdtemp(prefix="bank_sched_cli_")
@@ -2970,6 +2978,14 @@ def test_schedule_cli_commands():
 
         print("[PASS] schedule CLI 子命令 测试通过\n")
 
+    except AssertionError:
+        print("  [TRACEBACK]")
+        traceback.print_exc()
+        raise
+    except Exception:
+        print("  [TRACEBACK]")
+        traceback.print_exc()
+        raise
     finally:
         if "BANK_RECONCILE_HOME" in os.environ:
             del os.environ["BANK_RECONCILE_HOME"]
@@ -3231,7 +3247,8 @@ def test_snapshot_restore_cross_directory():
         print(f"  人工标记保留: status={marked_disp.status.value}, reviewer={marked_disp.reviewer}, "
               f"rollback_entries={len(marked_disp.rollback_history)}")
 
-        r = runner.invoke(cli, ["rollback", "-b", batch_id, "-d", first_disp_id])
+        r = runner.invoke(cli, ["rollback", "-b", batch_id, "-d", first_disp_id,
+                              "-r", "restore_tester"])
         check("恢复后: rollback 可执行", r)
         post_batch2 = post_storage.load(batch_id)
         rolled = next(d for d in post_batch2.discrepancies if d.discrepancy_id == first_disp_id)
@@ -4096,7 +4113,572 @@ def test_health_audit_records_queryable():
         shutil.rmtree(tmpdir, ignore_errors=True)
 
 
+# ============================================================
+# 差异认领工作台 (claim) 端到端测试
+# ============================================================
+
+def _setup_claim_env(tmpdir: str, samples_dir: str) -> Tuple[str, List[str]]:
+    """搭建认领测试环境: 创建批次+导入+匹配，返回(batch_id, 差异ID列表)."""
+    os.environ["BANK_RECONCILE_HOME"] = tmpdir
+    from click.testing import CliRunner
+    from bank_reconcile.cli import cli
+    runner = CliRunner()
+
+    r = runner.invoke(cli, ["create", "认领测试批次"])
+    assert r.exit_code == 0, f"create failed: {r.output}"
+    batch_line = [ln for ln in r.output.splitlines() if "BATCH-" in ln][0]
+    batch_id = batch_line.split("(ID: ")[1].rstrip(")").strip()
+
+    for ftype, fname in [("bank", "bank_statement.csv"),
+                          ("system", "system_receipt.csv"),
+                          ("adjustment", "manual_adjustment.csv")]:
+        r = runner.invoke(cli, ["import", "-b", batch_id, "-t", ftype,
+                                os.path.join(samples_dir, fname)])
+        assert r.exit_code == 0, f"import {ftype} failed: {r.output}"
+
+    r = runner.invoke(cli, ["match", "-b", batch_id])
+    assert r.exit_code == 0, f"match failed: {r.output}"
+
+    storage = BatchStorage(tmpdir)
+    batch = storage.load(batch_id)
+    disp_ids = [d.discrepancy_id for d in batch.discrepancies]
+    assert len(disp_ids) >= 3, f"应至少3条差异, 实际{len(disp_ids)}"
+    return batch_id, disp_ids
+
+
+def test_claim_persistence_cross_restart():
+    """场景C1: 认领状态持久化，重启后仍可查到."""
+    print("=== 场景C1: 认领状态持久化（跨重启） ===")
+    samples_dir = os.path.join(os.path.dirname(__file__), "samples")
+    tmpdir = tempfile.mkdtemp(prefix="bank_claim_persist_")
+
+    try:
+        batch_id, disp_ids = _setup_claim_env(tmpdir, samples_dir)
+        from click.testing import CliRunner
+        from bank_reconcile.cli import cli
+        from bank_reconcile.claim import ClaimStorage, ClaimStatus
+        runner = CliRunner()
+
+        def check(desc, result, expected_exit=0):
+            assert result.exit_code == expected_exit, \
+                f"[{desc}] exit={result.exit_code} expect={expected_exit}, out={result.output}" \
+                + (f"\n exc={result.exception}" if result.exception else "")
+            print(f"  [OK] {desc}")
+
+        test_id1, test_id2 = disp_ids[0], disp_ids[1]
+        claimant_a = "alice_claim"
+
+        r = runner.invoke(cli, [
+            "claim", "take",
+            "-b", batch_id, "-d", f"{test_id1},{test_id2}",
+            "-u", claimant_a, "-n", "C1持久化测试"
+        ])
+        check("claim take 2条", r)
+        assert "成功认领" in r.output and "2" in r.output
+        print(f"  alice 认领 {test_id1}, {test_id2}")
+
+        claim1 = ClaimStorage(tmpdir)
+        current1 = claim1.get_current(batch_id, test_id1)
+        current2 = claim1.get_current(batch_id, test_id2)
+        assert current1 is not None and current1.claimant == claimant_a
+        assert current2 is not None and current2.claimant == claimant_a
+        assert current1.status == ClaimStatus.CLAIMED
+        print(f"  实例1校验: {current1.claim_id}/{current2.claim_id} 状态={current1.status.value}")
+
+        del claim1
+        claim2 = ClaimStorage(tmpdir)
+        curr1_v2 = claim2.get_current(batch_id, test_id1)
+        curr2_v2 = claim2.get_current(batch_id, test_id2)
+        assert curr1_v2 is not None and curr1_v2.claimant == claimant_a, \
+            f"重启后应为{claimant_a}, 实际={curr1_v2 and curr1_v2.claimant}"
+        assert curr2_v2 is not None and curr2_v2.claimant == claimant_a
+        print("  实例2(模拟重启): 认领状态保留 [OK]")
+
+        r = runner.invoke(cli, ["claim", "list", "-b", batch_id, "-u", claimant_a])
+        check("claim list 按认领人筛选", r)
+        assert claimant_a in r.output and "claimed" in r.output
+        print("  CLI list 可查询到认领记录")
+
+        audit = AuditStorage(tmpdir)
+        take_records = audit.query(batch_id=batch_id, op_type="claim_take")
+        assert len(take_records) >= 1, f"claim_take 审计记录应存在, 实际{len(take_records)}"
+        list_records = audit.query(batch_id=batch_id, op_type="claim_list")
+        assert len(list_records) >= 1
+        print(f"  审计: claim_take×{len(take_records)}, claim_list×{len(list_records)}")
+
+        r = runner.invoke(cli, ["audit-log", "-b", batch_id, "-t", "claim_take"])
+        check("audit-log 查询 claim_take", r)
+        assert "认领" in r.output
+        print("  audit-log 可按类型查询 claim_take")
+
+        print("[PASS] 场景C1 (跨重启持久化) 通过\n")
+
+    finally:
+        if "BANK_RECONCILE_HOME" in os.environ:
+            del os.environ["BANK_RECONCILE_HOME"]
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+
+def test_claim_permission_conflict():
+    """场景C2: 权限冲突 - 已认领给别人的不能被普通用户标记/回滚."""
+    print("=== 场景C2: 权限冲突（他人认领的差异不能标记） ===")
+    samples_dir = os.path.join(os.path.dirname(__file__), "samples")
+    tmpdir = tempfile.mkdtemp(prefix="bank_claim_perm_")
+
+    try:
+        batch_id, disp_ids = _setup_claim_env(tmpdir, samples_dir)
+        from click.testing import CliRunner
+        from bank_reconcile.cli import cli
+        from bank_reconcile.claim import ClaimStorage
+        runner = CliRunner()
+
+        def check(desc, result, expected_exit=0):
+            assert result.exit_code == expected_exit, \
+                f"[{desc}] exit={result.exit_code} expect={expected_exit}, out={result.output}" \
+                + (f"\n exc={result.exception}" if result.exception else "")
+            print(f"  [OK] {desc}: exit={expected_exit}")
+
+        test_id = disp_ids[0]
+        alice = "alice_perm"
+        bob = "bob_perm"
+
+        r = runner.invoke(cli, [
+            "claim", "take", "-b", batch_id, "-d", test_id,
+            "-u", alice, "-n", "仅alice可处理"
+        ])
+        check("alice 认领", r)
+
+        r = runner.invoke(cli, [
+            "mark", "-b", batch_id, "-d", test_id,
+            "-s", "confirmed", "-r", bob, "-n", "bob尝试标记(应失败)"
+        ])
+        check("bob 标记他人认领差异 (应失败)", r, expected_exit=1)
+        assert "已由" in r.output and "认领" in r.output
+        print("  bob 被拒绝: 提示差异已由 alice 认领")
+
+        storage = BatchStorage(tmpdir)
+        batch = storage.load(batch_id)
+        disp = next(d for d in batch.discrepancies if d.discrepancy_id == test_id)
+        assert disp.status.value == "open", f"状态应仍为open, 实际={disp.status.value}"
+        assert disp.reviewer is None, "reviewer 应为 None"
+        print("  副作用校验: 状态未被改变 [OK]")
+
+        r = runner.invoke(cli, [
+            "mark", "-b", batch_id, "-d", test_id,
+            "-s", "confirmed", "-r", alice, "-n", "alice本人标记"
+        ])
+        check("alice 本人标记 (应成功)", r)
+
+        batch2 = storage.load(batch_id)
+        disp2 = next(d for d in batch2.discrepancies if d.discrepancy_id == test_id)
+        assert disp2.status.value == "confirmed"
+        assert disp2.reviewer == alice
+        print("  alice 本人成功标记: status=confirmed, reviewer=alice")
+
+        r = runner.invoke(cli, [
+            "rollback", "-b", batch_id, "-d", test_id, "-r", bob
+        ])
+        check("bob 回滚他人认领 (应失败)", r, expected_exit=1)
+        assert "认领" in r.output
+        print("  bob 回滚被拒绝")
+
+        r = runner.invoke(cli, [
+            "rollback", "-b", batch_id, "-d", test_id, "-r", alice
+        ])
+        check("alice 本人回滚 (应成功)", r)
+
+        audit = AuditStorage(tmpdir)
+        mark_fail = audit.query(batch_id=batch_id, op_type="mark_fail")
+        rollback_fail = audit.query(batch_id=batch_id, op_type="rollback_fail")
+        assert len(mark_fail) >= 1, f"mark_fail 审计应存在, 实际{len(mark_fail)}"
+        assert len(rollback_fail) >= 1, f"rollback_fail 审计应存在, 实际{len(rollback_fail)}"
+        print(f"  失败审计: mark_fail×{len(mark_fail)}, rollback_fail×{len(rollback_fail)}")
+
+        unclaimed_id = disp_ids[1]
+        r = runner.invoke(cli, [
+            "mark", "-b", batch_id, "-d", unclaimed_id,
+            "-s", "ignored", "-r", bob, "-n", "未认领的任何人可标记"
+        ])
+        check("bob 标记未认领差异 (应成功)", r)
+        print("  未认领差异: 任何人都可以标记 [OK]")
+
+        print("[PASS] 场景C2 (权限冲突) 通过\n")
+
+    finally:
+        if "BANK_RECONCILE_HOME" in os.environ:
+            del os.environ["BANK_RECONCILE_HOME"]
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+
+def test_claim_bulk_take_and_release_reclaim():
+    """场景C3: 批量认领 + 释放后再认领."""
+    print("=== 场景C3: 批量认领 + 释放后再认领 ===")
+    samples_dir = os.path.join(os.path.dirname(__file__), "samples")
+    tmpdir = tempfile.mkdtemp(prefix="bank_claim_bulk_")
+
+    try:
+        batch_id, disp_ids = _setup_claim_env(tmpdir, samples_dir)
+        from click.testing import CliRunner
+        from bank_reconcile.cli import cli
+        from bank_reconcile.claim import ClaimStorage, ClaimStatus
+        runner = CliRunner()
+
+        def check(desc, result, expected_exit=0):
+            assert result.exit_code == expected_exit, \
+                f"[{desc}] exit={result.exit_code} expect={expected_exit}, out={result.output}" \
+                + (f"\n exc={result.exception}" if result.exception else "")
+            print(f"  [OK] {desc}: exit={expected_exit}")
+
+        bulk_ids = disp_ids[:3]
+        bulk_arg = ",".join(bulk_ids)
+        alice = "alice_bulk"
+        bob = "bob_bulk"
+        admin = "admin_bulk"
+
+        r = runner.invoke(cli, [
+            "claim", "take",
+            "-b", batch_id, "-d", bulk_arg,
+            "-u", alice, "-e", "8", "-n", "批量认领8小时"
+        ])
+        check(f"alice 批量认领 {len(bulk_ids)} 条", r)
+        assert "成功认领" in r.output
+        for did in bulk_ids:
+            assert did in r.output
+        print(f"  alice 批量认领: {len(bulk_ids)} 条, 过期=8h")
+
+        claim_storage = ClaimStorage(tmpdir)
+        for did in bulk_ids:
+            curr = claim_storage.get_current(batch_id, did)
+            assert curr is not None and curr.claimant == alice
+            assert curr.expires_at, f"{did} 应设置过期时间"
+        print("  批量认领校验: 每条均有 claimant=alice 且 expires_at 已设置")
+
+        r = runner.invoke(cli, [
+            "claim", "take",
+            "-b", batch_id, "-d", bulk_arg,
+            "-u", bob
+        ])
+        check("bob 重复认领 (应部分失败)", r)
+        assert "失败" in r.output or "WARN" in r.output
+        for did in bulk_ids:
+            assert f"已被 {alice} 认领" in r.output
+        print("  bob 重复认领全部被正确拒绝: 提示已被 alice 认领")
+
+        release_arg = bulk_ids[0]
+        r = runner.invoke(cli, [
+            "claim", "release",
+            "-b", batch_id, "-d", release_arg,
+            "-u", bob
+        ])
+        check("bob 释放 alice 的认领 (应失败)", r)
+        assert "失败" in r.output or "WARN" in r.output
+        print("  bob 非本人释放: 被拒绝 [OK]")
+
+        r = runner.invoke(cli, [
+            "claim", "release",
+            "-b", batch_id, "-d", release_arg,
+            "-u", alice, "-r", "alice主动释放"
+        ])
+        check("alice 本人释放", r)
+        assert "本人释放" in r.output and "成功" in r.output
+        print(f"  alice 本人释放 {release_arg} 成功")
+
+        curr_after_release = claim_storage.get_current(batch_id, release_arg)
+        assert curr_after_release is None or curr_after_release.claimant != alice
+        print("  释放后状态: 不再被 alice 认领 [OK]")
+
+        r = runner.invoke(cli, [
+            "claim", "take",
+            "-b", batch_id, "-d", release_arg,
+            "-u", bob, "-n", "bob接过alice释放的"
+        ])
+        check("bob 认领已释放的差异 (应成功)", r)
+        curr_bob = claim_storage.get_current(batch_id, release_arg)
+        assert curr_bob is not None and curr_bob.claimant == bob
+        print(f"  bob 成功重新认领 {release_arg} [OK]")
+
+        force_id = bulk_ids[1]
+        r = runner.invoke(cli, [
+            "claim", "release",
+            "-b", batch_id, "-d", force_id,
+            "-u", admin, "--force"
+        ])
+        check("管理员强制释放 (无原因应失败)", r, expected_exit=1)
+        assert "原因" in r.output or "reason" in r.output.lower()
+        print("  --force 无 --reason 被正确拒绝")
+
+        r = runner.invoke(cli, [
+            "claim", "release",
+            "-b", batch_id, "-d", force_id,
+            "-u", admin, "-r", "人员休假，工作移交", "--force"
+        ])
+        check("管理员强制释放 (带原因)", r)
+        assert "强制释放" in r.output and "成功" in r.output
+        print(f"  admin 强制释放 {force_id} 成功, 原因已记录")
+
+        history = claim_storage.list_history(batch_id, force_id)
+        force_rec = next((h for h in history if h.is_force_release), None)
+        assert force_rec is not None
+        assert force_rec.release_operator == admin
+        assert "休假" in force_rec.release_reason
+        assert force_rec.is_force_release is True
+        print("  历史记录: force_release=True, operator=admin, reason含'休假' [OK]")
+
+        r = runner.invoke(cli, [
+            "claim", "take",
+            "-b", batch_id, "-d", force_id,
+            "-u", bob
+        ])
+        check("bob 认领被强制释放的差异", r)
+        print("  释放后可重新认领: 完整闭环 [OK]")
+
+        audit = AuditStorage(tmpdir)
+        cmds = {r["command"] for r in audit.query(batch_id=batch_id)}
+        expected_cmds = {"claim_take", "claim_release", "claim_release_force",
+                         "claim_take_fail", "claim_release_fail"}
+        for ec in expected_cmds:
+            assert ec in cmds, f"缺少审计类型: {ec}, 实际={cmds}"
+        print(f"  审计类型齐全: {sorted(expected_cmds & cmds)}")
+
+        print("[PASS] 场景C3 (批量认领+释放再认领) 通过\n")
+
+    finally:
+        if "BANK_RECONCILE_HOME" in os.environ:
+            del os.environ["BANK_RECONCILE_HOME"]
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+
+def test_claim_export_json_csv_consistency():
+    """场景C4: JSON/CSV 导出一致性 + 路径冲突."""
+    print("=== 场景C4: JSON/CSV 导出一致性 + 路径冲突 ===")
+    samples_dir = os.path.join(os.path.dirname(__file__), "samples")
+    tmpdir = tempfile.mkdtemp(prefix="bank_claim_export_")
+
+    try:
+        batch_id, disp_ids = _setup_claim_env(tmpdir, samples_dir)
+        from click.testing import CliRunner
+        from bank_reconcile.cli import cli
+        runner = CliRunner()
+
+        def check(desc, result, expected_exit=0):
+            assert result.exit_code == expected_exit, \
+                f"[{desc}] exit={result.exit_code} expect={expected_exit}, out={result.output}" \
+                + (f"\n exc={result.exception}" if result.exception else "")
+            print(f"  [OK] {desc}: exit={expected_exit}")
+
+        alice = "alice_export"
+        bob = "bob_export"
+        r = runner.invoke(cli, [
+            "claim", "take", "-b", batch_id,
+            "-d", ",".join(disp_ids[:2]),
+            "-u", alice
+        ])
+        check("alice 认领2条", r)
+        r = runner.invoke(cli, [
+            "claim", "take", "-b", batch_id,
+            "-d", disp_ids[2],
+            "-u", bob
+        ])
+        check("bob 认领1条", r)
+
+        dir_path = os.path.join(tmpdir, "subdir_claim")
+        os.makedirs(dir_path, exist_ok=True)
+        r = runner.invoke(cli, [
+            "claim", "export", "-b", batch_id, "-o", dir_path, "-f", "json"
+        ])
+        check("导出路径=目录 (应失败)", r, expected_exit=1)
+        assert "目录" in r.output and "冲突" in r.output
+        print("  导出路径=目录: 正确提示冲突 [OK]")
+
+        json_out = os.path.join(tmpdir, "claims.json")
+        r = runner.invoke(cli, [
+            "claim", "export", "-b", batch_id, "-o", json_out, "-f", "json"
+        ])
+        check("导出 JSON", r)
+        assert os.path.isfile(json_out)
+        with open(json_out, "r", encoding="utf-8") as f:
+            json_data = json.load(f)
+        assert "current_claims" in json_data
+        assert "claim_history" in json_data
+        assert "summary" in json_data
+        json_current_count = len(json_data["current_claims"])
+        assert json_current_count >= 3
+        print(f"  JSON结构校验: current_claims={json_current_count}, "
+              f"history={len(json_data['claim_history'])}, summary 存在")
+
+        summary = json_data["summary"]
+        assert "claimed" in summary.get("by_status", {}), "按状态汇总应含 claimed"
+        assert alice in summary.get("by_claimant", {}), "按认领人汇总应含 alice"
+        print(f"  JSON summary: by_status={summary['by_status']}, by_claimant={summary['by_claimant']}")
+
+        csv_out = os.path.join(tmpdir, "claims.csv")
+        r = runner.invoke(cli, [
+            "claim", "export", "-b", batch_id, "-o", csv_out, "-f", "csv"
+        ])
+        check("导出 CSV", r)
+        assert os.path.isfile(csv_out)
+        with open(csv_out, "r", encoding="utf-8-sig", newline="") as f:
+            reader = csv.DictReader(f)
+            csv_rows = list(reader)
+            csv_headers = reader.fieldnames
+        assert csv_headers is not None
+        required_cols = ["claim_id", "batch_id", "discrepancy_id", "claimant",
+                         "status", "claimed_at", "expires_at", "note"]
+        for col in required_cols:
+            assert col in csv_headers, f"CSV缺少列: {col}, 实际={csv_headers}"
+        print(f"  CSV 列完整: {len(csv_headers)} 列, {len(csv_rows)} 行")
+
+        assert len(csv_rows) == json_current_count, \
+            f"CSV行数({len(csv_rows)}) 应等于 JSON current_claims({json_current_count})"
+        print(f"  JSON/CSV 一致性: 均为 {len(csv_rows)} 条当前认领记录 [OK]")
+
+        json_claimants = {c["claimant"] for c in json_data["current_claims"] if c.get("claimant")}
+        csv_claimants = {r["claimant"] for r in csv_rows if r.get("claimant")}
+        assert json_claimants == csv_claimants == {alice, bob}, \
+            f"认领人集合不一致: JSON={json_claimants}, CSV={csv_claimants}"
+        print(f"  JSON/CSV 认领人集合一致: {json_claimants} [OK]")
+
+        json_ids = {c["discrepancy_id"] for c in json_data["current_claims"]}
+        csv_ids = {r["discrepancy_id"] for r in csv_rows}
+        assert json_ids == csv_ids, "JSON/CSV 差异ID集合应一致"
+        print(f"  JSON/CSV 差异ID集合一致: {len(json_ids)} 个 [OK]")
+
+        audit = AuditStorage(tmpdir)
+        export_records = audit.query(batch_id=batch_id, op_type="claim_export")
+        export_fail = audit.query(batch_id=batch_id, op_type="claim_export_fail")
+        assert len(export_records) >= 2, f"claim_export 审计应≥2, 实际{len(export_records)}"
+        assert len(export_fail) >= 1, f"claim_export_fail 应≥1, 实际{len(export_fail)}"
+        print(f"  审计: claim_export×{len(export_records)}, claim_export_fail×{len(export_fail)}")
+
+        r = runner.invoke(cli, ["audit-log", "-b", batch_id, "-t", "claim_export"])
+        check("audit-log 查询 claim_export", r)
+        assert "交接清单" in r.output or "交接" in r.output or "claim_export" in r.output
+        print("  audit-log 可按类型查询 claim_export")
+
+        nonexistent_batch = "BATCH-NOTEXIST001"
+        r = runner.invoke(cli, [
+            "claim", "list", "-b", nonexistent_batch
+        ])
+        check("claim list 批次不存在 (应失败)", r, expected_exit=1)
+        assert "不存在" in r.output
+        print("  claim list 不存在批次: 正确提示错误 [OK]")
+
+        r = runner.invoke(cli, [
+            "claim", "take", "-b", nonexistent_batch,
+            "-d", "DISP-FAKE", "-u", alice
+        ])
+        check("claim take 批次不存在 (应失败)", r, expected_exit=1)
+        assert "不存在" in r.output
+        print("  claim take 不存在批次: 正确提示错误 [OK]")
+
+        bad_disp_id = "DISP-DEFINITELY-NOT-EXIST"
+        r = runner.invoke(cli, [
+            "claim", "take", "-b", batch_id,
+            "-d", bad_disp_id, "-u", alice
+        ])
+        check("claim take 差异不存在 (应列出失败)", r, expected_exit=1)
+        assert "差异不存在" in r.output
+        print("  claim take 不存在差异: 正确列出失败项 [OK]")
+
+        r = runner.invoke(cli, [
+            "claim", "take", "-b", batch_id,
+            "-d", disp_ids[0], "-u", "  "
+        ])
+        check("claim take 操作者为空 (应失败)", r, expected_exit=1)
+        assert "不能为空" in r.output or "claimant" in r.output.lower()
+        print("  claim take 空认领人: 正确拒绝 [OK]")
+
+        export_fail2 = audit.query(op_type="claim_list_fail")
+        assert len(export_fail2) >= 1, f"claim_list_fail 应存在, 实际{len(export_fail2)}"
+        print(f"  失败审计完整性: claim_list_fail×{len(export_fail2)}")
+
+        print("[PASS] 场景C4 (JSON/CSV一致性+路径冲突+错误) 通过\n")
+
+    finally:
+        if "BANK_RECONCILE_HOME" in os.environ:
+            del os.environ["BANK_RECONCILE_HOME"]
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+
+def test_claim_status_filter_and_release_history():
+    """场景C5: list 按状态筛选 + 释放后历史记录."""
+    print("=== 场景C5: list 状态筛选 + 释放历史记录 ===")
+    samples_dir = os.path.join(os.path.dirname(__file__), "samples")
+    tmpdir = tempfile.mkdtemp(prefix="bank_claim_filter_")
+
+    try:
+        batch_id, disp_ids = _setup_claim_env(tmpdir, samples_dir)
+        from click.testing import CliRunner
+        from bank_reconcile.cli import cli
+        from bank_reconcile.claim import ClaimStorage
+        runner = CliRunner()
+
+        def check(desc, result, expected_exit=0):
+            assert result.exit_code == expected_exit, \
+                f"[{desc}] exit={result.exit_code} expect={expected_exit}, out={result.output}" \
+                + (f"\n exc={result.exception}" if result.exception else "")
+            print(f"  [OK] {desc}: exit={expected_exit}")
+
+        alice = "alice_filter"
+        id_claimed = disp_ids[0]
+        id_pending = disp_ids[1]
+        id_released = disp_ids[2]
+
+        r = runner.invoke(cli, [
+            "claim", "take", "-b", batch_id,
+            "-d", f"{id_claimed},{id_released}", "-u", alice
+        ])
+        check("alice 认领2条", r)
+
+        r = runner.invoke(cli, [
+            "claim", "release", "-b", batch_id,
+            "-d", id_released, "-u", alice, "-r", "C5释放"
+        ])
+        check("alice 释放 1 条", r)
+
+        r = runner.invoke(cli, ["claim", "list", "-b", batch_id, "-s", "claimed"])
+        check("claim list -s claimed", r)
+        assert id_claimed in r.output and "claimed" in r.output
+        print("  list -s claimed: 显示已认领的差异 [OK]")
+
+        r = runner.invoke(cli, ["claim", "list", "-b", batch_id, "-s", "pending"])
+        check("claim list -s pending", r)
+        assert id_pending in r.output
+        print("  list -s pending: 显示待处理的差异 [OK]")
+
+        r = runner.invoke(cli, ["claim", "list", "-b", batch_id, "-s", "released"])
+        check("claim list -s released", r)
+        print("  list -s released: 可查询已释放状态 [OK]")
+
+        r = runner.invoke(cli, ["claim", "list", "-b", batch_id, "-u", alice])
+        check("claim list -u alice", r)
+        assert id_claimed in r.output
+        print("  list -u alice: 按认领人筛选 [OK]")
+
+        claim_storage = ClaimStorage(tmpdir)
+        full_history = claim_storage.list_history(batch_id, id_released)
+        assert len(full_history) >= 2, \
+            f"释放后历史应≥2条(RELEASED + 新PENDING), 实际{len(full_history)}"
+        released_rec = next((h for h in full_history
+                             if h.status.value == "released" and h.claimant == alice), None)
+        assert released_rec is not None
+        assert released_rec.release_reason == "C5释放"
+        assert released_rec.release_operator == alice
+        assert released_rec.is_force_release is False
+        print(f"  历史记录: {len(full_history)} 条, "
+              f"RELEASED记录: operator={released_rec.release_operator}, "
+              f"reason={released_rec.release_reason}, force=False [OK]")
+
+        print("[PASS] 场景C5 (状态筛选+释放历史) 通过\n")
+
+    finally:
+        if "BANK_RECONCILE_HOME" in os.environ:
+            del os.environ["BANK_RECONCILE_HOME"]
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+
 def main():
+    os.environ["COLUMNS"] = "200"
     try:
         test_parser()
         test_rules()
@@ -4145,6 +4727,11 @@ def main():
         test_health_export_path_conflict()
         test_health_export_json_csv_consistency()
         test_health_audit_records_queryable()
+        test_claim_persistence_cross_restart()
+        test_claim_permission_conflict()
+        test_claim_bulk_take_and_release_reclaim()
+        test_claim_export_json_csv_consistency()
+        test_claim_status_filter_and_release_history()
         print("=" * 50)
         print("所有测试通过！")
         print("=" * 50)

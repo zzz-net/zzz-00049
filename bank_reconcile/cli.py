@@ -57,6 +57,19 @@ from .health import (
     IssueLevel,
     CheckCategory,
 )
+from .claim import (
+    ClaimStorage,
+    ClaimStatus,
+    ClaimRecord,
+    ClaimError,
+    BatchNotFoundError,
+    DiscrepancyNotFoundError,
+    AlreadyClaimedError,
+    NotClaimantError,
+    OperatorMissingError,
+    ExportPathConflictError,
+    ClaimPermissionDeniedError,
+)
 
 
 console = Console(highlight=False, emoji=False, markup=True)
@@ -69,6 +82,10 @@ def _get_storage() -> BatchStorage:
 
 def _get_audit(storage: BatchStorage) -> AuditStorage:
     return AuditStorage(storage.storage_dir)
+
+
+def _get_claim(storage: BatchStorage) -> ClaimStorage:
+    return ClaimStorage(storage.storage_dir)
 
 
 def _maybe_cleanup_audit(audit: AuditStorage, storage: BatchStorage) -> None:
@@ -690,6 +707,18 @@ def mark(batch_id: str, discrepancy_id: str, status: str, reviewer: str, note: s
         console.print(f"[red]ERR[/] 差异不存在: {discrepancy_id}")
         sys.exit(1)
 
+    claim = _get_claim(storage)
+    try:
+        claim.check_can_mark(batch_id, discrepancy_id, reviewer)
+    except ClaimPermissionDeniedError as e:
+        console.print(f"[red]ERR[/] {e}")
+        audit = _get_audit(storage)
+        audit.log(
+            "mark_fail", batch_id, 0,
+            f"标记 {discrepancy_id} 失败: {str(e)}"
+        )
+        sys.exit(1)
+
     found.mark(target_status, reviewer, note)
     storage.save(batch)
 
@@ -712,7 +741,8 @@ def mark(batch_id: str, discrepancy_id: str, status: str, reviewer: str, note: s
 @cli.command(help="回滚差异状态到上一步")
 @click.option("--batch-id", "-b", required=True, help="批次ID")
 @click.option("--discrepancy-id", "-d", required=True, help="差异ID")
-def rollback(batch_id: str, discrepancy_id: str) -> None:
+@click.option("--operator", "-r", required=True, help="操作人（用于认领权限校验）")
+def rollback(batch_id: str, discrepancy_id: str, operator: str) -> None:
     storage = _get_storage()
     if not storage.batch_exists_anywhere(batch_id):
         console.print(f"[red]ERR[/] 批次不存在: {batch_id}")
@@ -733,6 +763,18 @@ def rollback(batch_id: str, discrepancy_id: str) -> None:
 
     if not found:
         console.print(f"[red]ERR[/] 差异不存在: {discrepancy_id}")
+        sys.exit(1)
+
+    claim = _get_claim(storage)
+    try:
+        claim.check_can_mark(batch_id, discrepancy_id, operator)
+    except ClaimPermissionDeniedError as e:
+        console.print(f"[red]ERR[/] {e}")
+        audit = _get_audit(storage)
+        audit.log(
+            "rollback_fail", batch_id, 0,
+            f"回滚 {discrepancy_id} 失败: {str(e)}，操作人 {operator}"
+        )
         sys.exit(1)
 
     if found.rollback():
@@ -899,7 +941,7 @@ def reopen(batch_id: str) -> None:
 @click.option("--from", "from_date", default=None, help="起始日期 (YYYY-MM-DD)")
 @click.option("--to", "to_date", default=None, help="截止日期 (YYYY-MM-DD)")
 @click.option("--type", "-t", "op_type", default=None,
-              type=click.Choice(["import", "match", "mark", "rollback", "close", "reopen", "manual_link", "undo_manual_link", "tolerance_match", "schedule_add", "schedule_update", "schedule_delete", "schedule_run", "schedule_load", "snapshot_create", "snapshot_create_fail", "snapshot_restore", "snapshot_restore_fail", "health_check", "health_check_fail", "health_export", "health_export_fail"]),
+              type=click.Choice(["import", "match", "mark", "mark_fail", "rollback", "rollback_fail", "close", "reopen", "manual_link", "undo_manual_link", "tolerance_match", "schedule_add", "schedule_update", "schedule_delete", "schedule_run", "schedule_load", "snapshot_create", "snapshot_create_fail", "snapshot_restore", "snapshot_restore_fail", "health_check", "health_check_fail", "health_export", "health_export_fail", "claim_list", "claim_list_fail", "claim_take", "claim_take_fail", "claim_release", "claim_release_force", "claim_release_fail", "claim_export", "claim_export_fail", "archive", "restore"]),
               help="按操作类型过滤")
 @click.option("--batch", "-b", "batch_id", default=None, help="按批次ID过滤")
 @click.option("--output", "-o", default=None, help="导出文件路径（需配合 --format）")
@@ -1383,6 +1425,420 @@ def undo(batch_id: str) -> None:
     console.print(f"  系统: [green]{last_entry['system_txn_id']}[/]")
     console.print(f"  调整类型: [magenta]{last_entry['adjustment_type']}[/]")
     console.print(f"  操作时间: {last_entry['timestamp']}")
+
+
+def _validate_discrepancy_ids_in_batch(batch: Batch, discrepancy_ids: List[str]) -> Tuple[List[str], List[Dict[str, Any]]]:
+    """校验差异ID是否存在于批次中，返回(有效ID列表, 失败列表)."""
+    existing = {d.discrepancy_id for d in batch.discrepancies}
+    valid: List[str] = []
+    invalid: List[Dict[str, Any]] = []
+    for did in discrepancy_ids:
+        did = did.strip()
+        if not did:
+            continue
+        if did in existing:
+            valid.append(did)
+        else:
+            invalid.append({"discrepancy_id": did, "reason": "差异不存在于该批次"})
+    return valid, invalid
+
+
+def _parse_id_list(raw: str) -> List[str]:
+    """解析逗号分隔的ID列表."""
+    return [s.strip() for s in raw.split(",") if s.strip()]
+
+
+# ── claim group (list/take/release/export) ────────────────
+@cli.group("claim", help="差异认领工作台: 多人协作认领、释放、导出交接清单")
+def claim_group() -> None:
+    pass
+
+
+@claim_group.command("list", help="按批次/处理人/状态筛选认领记录")
+@click.option("--batch-id", "-b", default=None, help="批次ID (可选)")
+@click.option("--claimant", "-u", default=None, help="按认领人筛选 (可选)")
+@click.option("--status", "-s", default=None,
+              type=click.Choice(["pending", "claimed", "released"]),
+              help="按状态筛选: pending(待处理)/claimed(已认领)/released(已释放) (可选)")
+@click.option("--limit", "-n", default=50, help="显示条数")
+def claim_list(
+    batch_id: Optional[str],
+    claimant: Optional[str],
+    status: Optional[str],
+    limit: int,
+) -> None:
+    storage = _get_storage()
+    claim = _get_claim(storage)
+
+    if batch_id and not storage.batch_exists_anywhere(batch_id):
+        console.print(f"[red]ERR[/] 批次不存在: {batch_id}")
+        audit = _get_audit(storage)
+        audit.log("claim_list_fail", batch_id or "ALL", 0, f"列表查询失败: 批次不存在 {batch_id}")
+        sys.exit(1)
+
+    if batch_id and storage.batch_exists(batch_id):
+        batch = storage.load(batch_id)
+        all_disp_ids = [d.discrepancy_id for d in batch.discrepancies]
+        claim.ensure_pending_for_batch(batch_id, all_disp_ids)
+
+    status_enum = ClaimStatus(status) if status else None
+    records = claim.list(batch_id=batch_id, claimant=claimant, status=status_enum)
+
+    if not records:
+        console.print("[yellow]无符合条件的认领记录[/]")
+        audit = _get_audit(storage)
+        audit.log(
+            "claim_list", batch_id or "ALL", 0,
+            f"查询认领记录: 批次={batch_id or '全部'}, 认领人={claimant or '全部'}, 状态={status or '全部'}, 结果=0条"
+        )
+        return
+
+    display_records = records[:limit]
+
+    table = Table(title=f"认领记录（共 {len(records)} 条，显示前 {len(display_records)} 条）")
+    table.add_column("认领ID", style="cyan", overflow="fold")
+    table.add_column("批次ID", style="bold")
+    table.add_column("差异ID", style="green", overflow="fold")
+    table.add_column("认领人", style="magenta")
+    table.add_column("状态", style="yellow")
+    table.add_column("认领时间", style="dim")
+    table.add_column("过期时间", style="dim")
+    table.add_column("备注", style="dim", overflow="fold")
+
+    status_style_map = {
+        ClaimStatus.PENDING.value: "dim",
+        ClaimStatus.CLAIMED.value: "green",
+        ClaimStatus.RELEASED.value: "yellow",
+    }
+
+    for r in display_records:
+        status_style = status_style_map.get(r.status.value, "")
+        status_text = f"[{status_style}]{r.status.value}[/]" if status_style else r.status.value
+        table.add_row(
+            r.claim_id,
+            r.batch_id,
+            r.discrepancy_id,
+            r.claimant or "-",
+            status_text,
+            r.claimed_at[:19].replace("T", " ") if r.claimed_at else "-",
+            r.expires_at[:19].replace("T", " ") if r.expires_at else "-",
+            r.note[:30] + ("..." if len(r.note) > 30 else ""),
+        )
+    console.print(table)
+
+    summary_rows = []
+    by_status: Dict[str, int] = {}
+    by_claimant: Dict[str, int] = {}
+    for r in records:
+        by_status[r.status.value] = by_status.get(r.status.value, 0) + 1
+        if r.claimant:
+            by_claimant[r.claimant] = by_claimant.get(r.claimant, 0) + 1
+
+    if by_status:
+        sum_table = Table(title="认领汇总 - 按状态")
+        sum_table.add_column("状态", style="bold")
+        sum_table.add_column("数量", justify="right")
+        for s, c in sorted(by_status.items()):
+            st = status_style_map.get(s, "")
+            sum_table.add_row(f"[{st}]{s}[/]" if st else s, str(c))
+        console.print(sum_table)
+
+    if by_claimant:
+        uc_table = Table(title="认领汇总 - 按认领人")
+        uc_table.add_column("认领人", style="bold")
+        uc_table.add_column("数量", justify="right")
+        for u, c in sorted(by_claimant.items()):
+            uc_table.add_row(u, str(c))
+        console.print(uc_table)
+
+    audit = _get_audit(storage)
+    audit.log(
+        "claim_list", batch_id or "ALL", len(records),
+        f"查询认领记录: 批次={batch_id or '全部'}, 认领人={claimant or '全部'}, 状态={status or '全部'}, 共 {len(records)} 条"
+    )
+    _maybe_cleanup_audit(audit, storage)
+
+
+@claim_group.command("take", help="批量认领差异，支持过期时间和备注")
+@click.option("--batch-id", "-b", required=True, help="批次ID")
+@click.option("--discrepancy-ids", "-d", required=True,
+              help="差异ID，多个用逗号分隔，如 DISP-XXX,DISP-YYY")
+@click.option("--claimant", "-u", required=True, help="认领人")
+@click.option("--expires-hours", "-e", default=None, type=int,
+              help="过期时间（小时），到期后自动释放")
+@click.option("--note", "-n", default="", help="认领备注")
+def claim_take(
+    batch_id: str,
+    discrepancy_ids: str,
+    claimant: str,
+    expires_hours: Optional[int],
+    note: str,
+) -> None:
+    storage = _get_storage()
+    audit = _get_audit(storage)
+
+    if not storage.batch_exists_anywhere(batch_id):
+        console.print(f"[red]ERR[/] 批次不存在: {batch_id}")
+        audit.log("claim_take_fail", batch_id, 0, f"认领失败: 批次不存在 {batch_id}")
+        sys.exit(1)
+
+    batch = storage.load(batch_id)
+    if batch.is_closed:
+        console.print(f"[red]ERR[/] 批次已关闭（closed），禁止认领。请先 reopen 后再操作。")
+        audit.log("claim_take_fail", batch_id, 0, "认领失败: 批次已关闭")
+        sys.exit(1)
+    _check_archived_write_block(batch, "认领")
+
+    disp_ids = _parse_id_list(discrepancy_ids)
+    if not disp_ids:
+        console.print("[red]ERR[/] 请提供至少一个有效的差异ID")
+        audit.log("claim_take_fail", batch_id, 0, "认领失败: 未提供差异ID")
+        sys.exit(1)
+
+    valid_ids, invalid = _validate_discrepancy_ids_in_batch(batch, disp_ids)
+
+    if not valid_ids:
+        console.print("[red]ERR[/] 没有有效的差异ID:")
+        for f in invalid:
+            console.print(f"  - {f['discrepancy_id']}: {f['reason']}")
+        audit.log(
+            "claim_take_fail", batch_id, 0,
+            f"认领失败: 无有效差异ID, 认领人 {claimant}"
+        )
+        sys.exit(1)
+
+    claim = _get_claim(storage)
+    try:
+        successes, failures = claim.take(
+            batch_id, valid_ids, claimant, expires_hours=expires_hours, note=note
+        )
+    except OperatorMissingError as e:
+        console.print(f"[red]ERR[/] {e}")
+        audit.log("claim_take_fail", batch_id, 0, f"认领失败: {e}")
+        sys.exit(1)
+
+    all_failures = invalid + failures
+
+    if successes:
+        console.print(f"[green]OK[/] 成功认领 [bold]{len(successes)}[/] 条差异:")
+        table = Table(title="成功认领清单")
+        table.add_column("差异ID", style="green")
+        table.add_column("认领人", style="magenta")
+        table.add_column("过期时间", style="yellow")
+        table.add_column("备注", style="dim", overflow="fold")
+        for s in successes:
+            table.add_row(
+                s.discrepancy_id,
+                s.claimant,
+                s.expires_at[:19].replace("T", " ") if s.expires_at else "永不过期",
+                s.note[:40] + ("..." if len(s.note) > 40 else ""),
+            )
+        console.print(table)
+        success_ids = ",".join(s.discrepancy_id for s in successes)
+        audit.log(
+            "claim_take", batch_id, len(successes),
+            f"成功认领 {len(successes)} 条: {success_ids}, 认领人 {claimant}"
+            + (f", 过期 {expires_hours}h" if expires_hours else "")
+            + (f", 备注: {note}" if note else "")
+        )
+
+    if all_failures:
+        console.print(f"[yellow]WARN[/] 失败 [bold]{len(all_failures)}[/] 条:")
+        table = Table(title="失败清单")
+        table.add_column("差异ID", style="red")
+        table.add_column("失败原因", style="yellow")
+        for f in all_failures:
+            table.add_row(f["discrepancy_id"], f["reason"])
+        console.print(table)
+        fail_ids = ",".join(f"{f['discrepancy_id']}({f['reason']})" for f in all_failures)
+        audit.log(
+            "claim_take_fail", batch_id, len(all_failures),
+            f"认领失败 {len(all_failures)} 条: {fail_ids}, 认领人 {claimant}"
+        )
+
+    _maybe_cleanup_audit(audit, storage)
+
+
+@claim_group.command("release", help="释放认领（本人释放 / 管理员 --force 强制释放）")
+@click.option("--batch-id", "-b", required=True, help="批次ID")
+@click.option("--discrepancy-ids", "-d", required=True,
+              help="差异ID，多个用逗号分隔")
+@click.option("--operator", "-u", required=True, help="操作人（认领人本人或管理员）")
+@click.option("--reason", "-r", default="",
+              help="释放原因（管理员强制释放时必填）")
+@click.option("--force", is_flag=True, help="管理员强制释放（需提供 --reason）")
+def claim_release(
+    batch_id: str,
+    discrepancy_ids: str,
+    operator: str,
+    reason: str,
+    force: bool,
+) -> None:
+    storage = _get_storage()
+    audit = _get_audit(storage)
+
+    if not storage.batch_exists_anywhere(batch_id):
+        console.print(f"[red]ERR[/] 批次不存在: {batch_id}")
+        audit.log("claim_release_fail", batch_id, 0, f"释放失败: 批次不存在 {batch_id}")
+        sys.exit(1)
+
+    batch = storage.load(batch_id)
+    if batch.is_closed:
+        console.print(f"[red]ERR[/] 批次已关闭（closed），禁止释放。请先 reopen 后再操作。")
+        audit.log("claim_release_fail", batch_id, 0, "释放失败: 批次已关闭")
+        sys.exit(1)
+    _check_archived_write_block(batch, "释放认领")
+
+    disp_ids = _parse_id_list(discrepancy_ids)
+    if not disp_ids:
+        console.print("[red]ERR[/] 请提供至少一个有效的差异ID")
+        audit.log("claim_release_fail", batch_id, 0, "释放失败: 未提供差异ID")
+        sys.exit(1)
+
+    valid_ids, invalid = _validate_discrepancy_ids_in_batch(batch, disp_ids)
+
+    if not valid_ids:
+        console.print("[red]ERR[/] 没有有效的差异ID:")
+        for f in invalid:
+            console.print(f"  - {f['discrepancy_id']}: {f['reason']}")
+        audit.log(
+            "claim_release_fail", batch_id, 0,
+            f"释放失败: 无有效差异ID, 操作人 {operator}"
+        )
+        sys.exit(1)
+
+    claim = _get_claim(storage)
+    try:
+        successes, failures = claim.release(
+            batch_id, valid_ids, operator, reason=reason, force=force
+        )
+    except (OperatorMissingError, ClaimError) as e:
+        console.print(f"[red]ERR[/] {e}")
+        audit.log("claim_release_fail", batch_id, 0, f"释放失败: {e}")
+        sys.exit(1)
+
+    all_failures = invalid + failures
+
+    release_type = "[magenta]管理员强制释放[/]" if force else "[green]本人释放[/]"
+
+    if successes:
+        console.print(f"[green]OK[/] {release_type}成功 [bold]{len(successes)}[/] 条差异:")
+        table = Table(title="释放成功清单")
+        table.add_column("差异ID", style="green")
+        table.add_column("原认领人", style="magenta")
+        table.add_column("释放方式", style="yellow")
+        table.add_column("释放原因", style="dim", overflow="fold")
+        for s in successes:
+            table.add_row(
+                s.discrepancy_id,
+                s.claimant or "-",
+                "强制释放" if s.is_force_release else "本人释放",
+                s.release_reason[:40] + ("..." if len(s.release_reason) > 40 else "-"),
+            )
+        console.print(table)
+        success_ids = ",".join(s.discrepancy_id for s in successes)
+        cmd_type = "claim_release_force" if force else "claim_release"
+        audit.log(
+            cmd_type, batch_id, len(successes),
+            f"释放成功 {len(successes)} 条: {success_ids}, 操作人 {operator}"
+            f", 类型={'强制' if force else '本人'}" + (f", 原因: {reason}" if reason else "")
+        )
+
+    if all_failures:
+        console.print(f"[yellow]WARN[/] 失败 [bold]{len(all_failures)}[/] 条:")
+        table = Table(title="失败清单")
+        table.add_column("差异ID", style="red")
+        table.add_column("失败原因", style="yellow")
+        for f in all_failures:
+            table.add_row(f["discrepancy_id"], f["reason"])
+        console.print(table)
+        fail_ids = ",".join(f"{f['discrepancy_id']}({f['reason']})" for f in all_failures)
+        audit.log(
+            "claim_release_fail", batch_id, len(all_failures),
+            f"释放失败 {len(all_failures)} 条: {fail_ids}, 操作人 {operator}"
+        )
+
+    _maybe_cleanup_audit(audit, storage)
+
+
+@claim_group.command("export", help="导出交接清单（JSON/CSV）")
+@click.option("--batch-id", "-b", default=None, help="批次ID (可选)")
+@click.option("--claimant", "-u", default=None, help="按认领人筛选 (可选)")
+@click.option("--status", "-s", default=None,
+              type=click.Choice(["pending", "claimed", "released"]),
+              help="按状态筛选 (可选)")
+@click.option("--output", "-o", required=True, help="输出文件路径")
+@click.option("--format", "-f", "fmt", required=True,
+              type=click.Choice(["json", "csv"]),
+              help="导出格式: json / csv")
+def claim_export(
+    batch_id: Optional[str],
+    claimant: Optional[str],
+    status: Optional[str],
+    output: str,
+    fmt: str,
+) -> None:
+    storage = _get_storage()
+    audit = _get_audit(storage)
+
+    if batch_id and not storage.batch_exists_anywhere(batch_id):
+        console.print(f"[red]ERR[/] 批次不存在: {batch_id}")
+        audit.log("claim_export_fail", batch_id or "ALL", 0, f"导出失败: 批次不存在 {batch_id}")
+        sys.exit(1)
+
+    abs_output = os.path.abspath(output)
+    if os.path.isdir(abs_output):
+        console.print(f"[red]ERR[/] 导出路径冲突: '{output}' 是一个目录，请指定文件路径")
+        audit.log("claim_export_fail", batch_id or "ALL", 0, f"导出失败: 路径是目录 {output}")
+        sys.exit(1)
+
+    out_dir = os.path.dirname(abs_output)
+    if out_dir and not os.path.isdir(out_dir):
+        try:
+            os.makedirs(out_dir, exist_ok=True)
+        except OSError as e:
+            console.print(f"[red]ERR[/] 导出目录创建失败: {e}")
+            audit.log("claim_export_fail", batch_id or "ALL", 0, f"导出失败: 目录创建失败 {e}")
+            sys.exit(1)
+
+    if os.path.isfile(abs_output):
+        console.print(
+            f"[yellow]WARN[/] 输出文件已存在: {abs_output}\n"
+            f"  内容将被覆盖。"
+        )
+
+    claim = _get_claim(storage)
+    status_enum = ClaimStatus(status) if status else None
+
+    if batch_id and storage.batch_exists(batch_id):
+        batch = storage.load(batch_id)
+        all_disp_ids = [d.discrepancy_id for d in batch.discrepancies]
+        claim.ensure_pending_for_batch(batch_id, all_disp_ids)
+
+    try:
+        if fmt == "json":
+            count = claim.export_json(abs_output, batch_id, claimant, status_enum)
+        else:
+            count = claim.export_csv(abs_output, batch_id, claimant, status_enum)
+    except OSError as e:
+        console.print(f"[red]ERR[/] 导出失败: {e}")
+        audit.log(
+            "claim_export_fail", batch_id or "ALL", 0,
+            f"导出失败: {e}, 路径 {output}"
+        )
+        sys.exit(1)
+
+    console.print(
+        f"[green]OK[/] 已导出 [bold]{count}[/] 条认领记录到 [cyan]{abs_output}[/]"
+        f" (格式: {fmt.upper()})"
+    )
+
+    audit.log(
+        "claim_export", batch_id or "ALL", count,
+        f"导出交接清单: {count} 条, 格式={fmt.upper()}, 路径={abs_output}"
+        f", 批次={batch_id or '全部'}, 认领人={claimant or '全部'}, 状态={status or '全部'}"
+    )
+    _maybe_cleanup_audit(audit, storage)
 
 
 # ── batch group (archive/restore/cleanup) ─────────────────
