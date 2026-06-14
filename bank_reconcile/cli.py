@@ -47,6 +47,16 @@ from .snapshot import (
     SnapshotConflictError,
     SNAPSHOT_FILE_EXT,
 )
+from .health import (
+    run_health_check,
+    export_health_report_json,
+    export_health_report_csv,
+    HealthCheckError,
+    HealthCheckCorruptedError,
+    HealthReport,
+    IssueLevel,
+    CheckCategory,
+)
 
 
 console = Console(highlight=False, emoji=False, markup=True)
@@ -889,7 +899,7 @@ def reopen(batch_id: str) -> None:
 @click.option("--from", "from_date", default=None, help="起始日期 (YYYY-MM-DD)")
 @click.option("--to", "to_date", default=None, help="截止日期 (YYYY-MM-DD)")
 @click.option("--type", "-t", "op_type", default=None,
-              type=click.Choice(["import", "match", "mark", "rollback", "close", "reopen", "manual_link", "undo_manual_link", "tolerance_match", "schedule_add", "schedule_update", "schedule_delete", "schedule_run", "schedule_load", "snapshot_create", "snapshot_create_fail", "snapshot_restore", "snapshot_restore_fail"]),
+              type=click.Choice(["import", "match", "mark", "rollback", "close", "reopen", "manual_link", "undo_manual_link", "tolerance_match", "schedule_add", "schedule_update", "schedule_delete", "schedule_run", "schedule_load", "snapshot_create", "snapshot_create_fail", "snapshot_restore", "snapshot_restore_fail", "health_check", "health_check_fail", "health_export", "health_export_fail"]),
               help="按操作类型过滤")
 @click.option("--batch", "-b", "batch_id", default=None, help="按批次ID过滤")
 @click.option("--output", "-o", default=None, help="导出文件路径（需配合 --format）")
@@ -2198,6 +2208,192 @@ def snapshot_restore(snapshot_path: str, target_dir: Optional[str],
         f"[dim]提示: 使用 audit-log -b {result['batch_id']} 查询审计[/]",
         title="快照恢复结果",
     ))
+
+
+
+
+
+# ── health group ──────────────────────────────────────────
+@cli.group("health", help="批次健康检查: 一键检查批次数据完整性并导出报告")
+def health_group() -> None:
+    pass
+
+
+@health_group.command("check", help="执行批次健康检查")
+@click.option("--batch-id", "-b", required=True, help="批次ID")
+def health_check(batch_id: str) -> None:
+    storage = _get_storage()
+    audit = _get_audit(storage)
+
+    try:
+        report = run_health_check(storage, batch_id)
+    except HealthCheckCorruptedError as e:
+        console.print(f"[red]ERR[/] 审计库损坏: {e}")
+        try:
+            audit.log("health_check_fail", batch_id, 0, f"健康检查失败: 审计库损坏 - {e}")
+        except Exception:
+            pass
+        _maybe_cleanup_audit(audit, storage)
+        sys.exit(1)
+    except HealthCheckError as e:
+        console.print(f"[red]ERR[/] {e}")
+        try:
+            audit.log("health_check_fail", batch_id, 0, f"健康检查失败: {e}")
+        except Exception:
+            pass
+        _maybe_cleanup_audit(audit, storage)
+        sys.exit(1)
+
+    summary = report._summary()
+    level_style = {
+        IssueLevel.OK: "green",
+        IssueLevel.INFO: "cyan",
+        IssueLevel.WARNING: "yellow",
+        IssueLevel.CRITICAL: "red",
+    }
+    overall_style = level_style.get(report.overall_status, "white")
+
+    console.print(Panel.fit(
+        f"[bold cyan]批次:[/] {report.batch_name}  [dim]({report.batch_id})[/]\n"
+        f"[bold]状态:[/] [{overall_style}]{report.overall_status.value.upper()}[/]  "
+        f"[bold]批次状态:[/] {report.batch_status}\n"
+        f"[bold]检查时间:[/] {report.generated_at[:19].replace('T', ' ')}\n"
+        f"[bold]问题汇总:[/] "
+        f"[green]OK: {summary['ok']}[/]  "
+        f"[cyan]INFO: {summary['info']}[/]  "
+        f"[yellow]WARNING: {summary['warning']}[/]  "
+        f"[red]CRITICAL: {summary['critical']}[/]",
+        title="批次健康检查结果",
+    ))
+
+    category_labels = {
+        CheckCategory.FILES: "导入文件",
+        CheckCategory.RULES: "规则配置",
+        CheckCategory.MATCH: "匹配结果",
+        CheckCategory.MARKERS: "标记与回滚",
+        CheckCategory.AUDIT: "审计日志",
+    }
+
+    for category in CheckCategory:
+        category_issues = [i for i in report.issues if i.category == category]
+        if not category_issues:
+            continue
+        table = Table(title=f"{category_labels.get(category, category.value)}")
+        table.add_column("级别", style="bold")
+        table.add_column("检查项", style="cyan")
+        table.add_column("说明", overflow="fold")
+        table.add_column("建议", overflow="fold")
+
+        for issue in category_issues:
+            style = level_style.get(issue.level, "white")
+            table.add_row(
+                f"[{style}]{issue.level.value.upper()}[/]",
+                issue.check_name,
+                issue.description,
+                issue.suggestion or "-",
+            )
+        console.print(table)
+
+    issue_count = len([i for i in report.issues if i.level in (IssueLevel.WARNING, IssueLevel.CRITICAL)])
+    try:
+        audit.log(
+            "health_check", batch_id, issue_count,
+            f"健康检查完成: 总体 {report.overall_status.value}, "
+            f"OK={summary['ok']} INFO={summary['info']} "
+            f"WARNING={summary['warning']} CRITICAL={summary['critical']}"
+        )
+    except Exception:
+        pass
+    _maybe_cleanup_audit(audit, storage)
+
+    if report.overall_status == IssueLevel.CRITICAL:
+        console.print("\n[red]存在严重问题，不建议继续导出或交接。[/]")
+        sys.exit(2)
+    elif report.overall_status == IssueLevel.WARNING:
+        console.print("\n[yellow]存在警告问题，建议处理后再继续。[/]")
+
+
+@health_group.command("export", help="导出健康检查报告 (JSON/CSV)")
+@click.option("--batch-id", "-b", required=True, help="批次ID")
+@click.option("--output", "-o", required=True, help="输出文件路径")
+@click.option("--format", "-f", "fmt", required=True,
+              type=click.Choice(["json", "csv"]),
+              help="导出格式: json / csv")
+@click.option("--force", is_flag=True, help="输出文件已存在时强制覆盖")
+def health_export(batch_id: str, output: str, fmt: str, force: bool) -> None:
+    storage = _get_storage()
+    audit = _get_audit(storage)
+
+    abs_output = os.path.abspath(output)
+    if os.path.exists(abs_output) and not force:
+        console.print(
+            f"[red]ERR[/] 输出文件已存在: {abs_output}\n"
+            f"  使用 [cyan]--force[/] 覆盖，或选择其他路径。"
+        )
+        try:
+            audit.log(
+                "health_export_fail", batch_id, 0,
+                f"健康报告导出失败: 输出路径冲突 - {abs_output}"
+            )
+        except Exception:
+            pass
+        _maybe_cleanup_audit(audit, storage)
+        sys.exit(1)
+
+    try:
+        report = run_health_check(storage, batch_id)
+    except HealthCheckCorruptedError as e:
+        console.print(f"[red]ERR[/] 审计库损坏: {e}")
+        try:
+            audit.log("health_export_fail", batch_id, 0, f"健康报告导出失败: 审计库损坏 - {e}")
+        except Exception:
+            pass
+        _maybe_cleanup_audit(audit, storage)
+        sys.exit(1)
+    except HealthCheckError as e:
+        console.print(f"[red]ERR[/] {e}")
+        try:
+            audit.log("health_export_fail", batch_id, 0, f"健康报告导出失败: {e}")
+        except Exception:
+            pass
+        _maybe_cleanup_audit(audit, storage)
+        sys.exit(1)
+
+    try:
+        if fmt == "json":
+            export_health_report_json(report, abs_output)
+        else:
+            export_health_report_csv(report, abs_output)
+    except OSError as e:
+        console.print(f"[red]ERR[/] 写入文件失败: {e}")
+        try:
+            audit.log(
+                "health_export_fail", batch_id, 0,
+                f"健康报告导出失败: 写入错误 - {e}"
+            )
+        except Exception:
+            pass
+        _maybe_cleanup_audit(audit, storage)
+        sys.exit(1)
+
+    summary = report._summary()
+    console.print(f"[green]OK[/] 健康报告已导出到 [cyan]{abs_output}[/]")
+    console.print(
+        f"  格式: {fmt.upper()}  "
+        f"总体状态: {report.overall_status.value.upper()}  "
+        f"问题: OK={summary['ok']} INFO={summary['info']} "
+        f"WARNING={summary['warning']} CRITICAL={summary['critical']}"
+    )
+
+    try:
+        audit.log(
+            "health_export", batch_id, len(report.issues),
+            f"健康报告导出成功: {abs_output} ({fmt.upper()}), "
+            f"总体 {report.overall_status.value}"
+        )
+    except Exception:
+        pass
+    _maybe_cleanup_audit(audit, storage)
 
 
 if __name__ == "__main__":

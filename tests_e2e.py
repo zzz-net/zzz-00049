@@ -4,6 +4,7 @@ import sys
 import shutil
 import tempfile
 import io
+import json
 from contextlib import redirect_stdout
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -3607,6 +3608,494 @@ def test_snapshot_export_consistency_and_audit():
         shutil.rmtree(snap_dir, ignore_errors=True)
 
 
+from bank_reconcile.health import (
+    run_health_check,
+    export_health_report_json,
+    export_health_report_csv,
+    HealthCheckError,
+    HealthCheckCorruptedError,
+    HealthReport,
+    IssueLevel,
+    CheckCategory,
+)
+
+
+def test_health_check_healthy_batch():
+    print("=== 测试健康批次检查 ===")
+    samples_dir = os.path.join(os.path.dirname(__file__), "samples")
+    tmpdir = tempfile.mkdtemp(prefix="bank_reconcile_health_")
+    os.environ["BANK_RECONCILE_HOME"] = tmpdir
+
+    try:
+        storage = BatchStorage(tmpdir)
+        audit = AuditStorage(tmpdir)
+
+        batch = Batch.create("健康测试批次")
+        storage.save(batch)
+        batch_id = batch.batch_id
+
+        from click.testing import CliRunner
+        from bank_reconcile.cli import cli
+        runner = CliRunner()
+
+        r = runner.invoke(cli, ["import", "-b", batch_id, "-t", "bank",
+                            os.path.join(samples_dir, "bank_statement.csv")])
+        assert r.exit_code == 0, f"import bank 失败: {r.output}"
+        r = runner.invoke(cli, ["import", "-b", batch_id, "-t", "system",
+                            os.path.join(samples_dir, "system_receipt.csv")])
+        assert r.exit_code == 0, f"import system 失败: {r.output}"
+        r = runner.invoke(cli, ["import", "-b", batch_id, "-t", "adjustment",
+                            os.path.join(samples_dir, "manual_adjustment.csv")])
+        assert r.exit_code == 0, f"import adjustment 失败: {r.output}"
+
+        r = runner.invoke(cli, ["rules", "set", "-b", batch_id,
+                            os.path.join(samples_dir, "rules.yaml")])
+        assert r.exit_code == 0, f"rules set 失败: {r.output}"
+
+        r = runner.invoke(cli, ["match", "-b", batch_id])
+        assert r.exit_code == 0, f"match 失败: {r.output}"
+
+        b = storage.load(batch_id)
+        assert len(b.discrepancies) > 0
+        first_disp_id = b.discrepancies[0].discrepancy_id
+
+        r = runner.invoke(cli, ["mark", "-b", batch_id, "-d", first_disp_id,
+                              "-s", "confirmed", "-r", "tester", "-n", "test"])
+        assert r.exit_code == 0, f"mark 失败: {r.output}"
+
+        report = run_health_check(storage, batch_id)
+        assert report.batch_id == batch_id
+        assert report.batch_name == "健康测试批次"
+        assert report.generated_at, "应有生成时间"
+        assert report.batch_status == "open", "批次状态应为 open"
+
+        print(f"  总体状态: {report.overall_status.value}")
+        summary = report._summary()
+        print(f"  问题汇总: OK={summary['ok']} INFO={summary['info']} "
+              f"WARNING={summary['warning']} CRITICAL={summary['critical']}")
+
+        categories_present = {i.category for i in report.issues}
+        assert CheckCategory.FILES in categories_present
+        assert CheckCategory.RULES in categories_present
+        assert CheckCategory.MATCH in categories_present
+        assert CheckCategory.MARKERS in categories_present
+        assert CheckCategory.AUDIT in categories_present
+        print("  五大检查类别均覆盖: OK")
+
+        audit_records = audit.query(batch_id=batch_id, op_type="health_check")
+        assert len(audit_records) == 0, "直接调用 run_health_check 不写入审计，由 CLI 负责"
+
+        r = runner.invoke(cli, ["health", "check", "-b", batch_id])
+        assert r.exit_code == 0, f"health check CLI 失败: {r.output}"
+        assert "批次健康检查结果" in r.output
+        print("  CLI health check 输出正常")
+
+        audit_records = audit.query(batch_id=batch_id, op_type="health_check")
+        assert len(audit_records) >= 1, "CLI health check 应写入审计日志"
+        print("  审计日志记录健康检查: OK")
+
+        print("[PASS] 健康批次检查测试通过\n")
+
+    finally:
+        if "BANK_RECONCILE_HOME" in os.environ:
+            del os.environ["BANK_RECONCILE_HOME"]
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+
+def test_health_check_missing_files_bad_rules():
+    print("=== 测试缺文件/坏规则检查 ===")
+    tmpdir = tempfile.mkdtemp(prefix="bank_reconcile_health_bad_")
+    os.environ["BANK_RECONCILE_HOME"] = tmpdir
+
+    try:
+        storage = BatchStorage(tmpdir)
+        audit = AuditStorage(tmpdir)
+
+        batch = Batch.create("问题批次")
+        storage.save(batch)
+        batch_id = batch.batch_id
+
+        report = run_health_check(storage, batch_id)
+        print(f"  总体状态: {report.overall_status.value}")
+        summary = report._summary()
+        print(f"  问题汇总: OK={summary['ok']} INFO={summary['info']} "
+              f"WARNING={summary['warning']} CRITICAL={summary['critical']}")
+
+        critical_issues = [i for i in report.issues if i.level == IssueLevel.CRITICAL]
+        missing_files_issue = next(
+            (i for i in critical_issues if i.check_name == "required_files_present"),
+            None
+        )
+        assert missing_files_issue is not None, "应检测到缺少必要文件"
+        assert "银行回单" in missing_files_issue.description or "系统流水" in missing_files_issue.description
+        print("  缺少必要文件检测: OK")
+
+        warning_issues = [i for i in report.issues if i.level == IssueLevel.WARNING]
+        rules_issue = next(
+            (i for i in warning_issues if i.check_name == "rules_configured"),
+            None
+        )
+        assert rules_issue is not None, "应检测到未设置规则文件"
+        print("  未设置规则检测: OK")
+
+        match_issue = next(
+            (i for i in warning_issues if i.check_name == "matching_done"),
+            None
+        )
+        assert match_issue is not None, "应检测到未执行匹配"
+        print("  未执行匹配检测: OK")
+
+        samples_dir = os.path.join(os.path.dirname(__file__), "samples")
+        bad_rules_path = os.path.join(samples_dir, "rules_bad.yaml")
+        b = storage.load(batch_id)
+        b.rule_file = bad_rules_path
+        storage.save(b)
+
+        from click.testing import CliRunner
+        from bank_reconcile.cli import cli
+        runner = CliRunner()
+        r = runner.invoke(cli, ["import", "-b", batch_id, "-t", "bank",
+                            os.path.join(samples_dir, "bank_statement.csv")])
+        assert r.exit_code == 0
+        r = runner.invoke(cli, ["import", "-b", batch_id, "-t", "system",
+                            os.path.join(samples_dir, "system_receipt.csv")])
+        assert r.exit_code == 0
+
+        report2 = run_health_check(storage, batch_id)
+        bad_rules_issues = [i for i in report2.issues
+                           if i.category == CheckCategory.RULES and i.level == IssueLevel.CRITICAL]
+        assert len(bad_rules_issues) >= 1, "应检测到坏规则文件"
+        print("  坏规则文件检测: OK")
+
+        nonexistent_batch = "BATCH-NONEXISTENT"
+        try:
+            run_health_check(storage, nonexistent_batch)
+            assert False, "应抛出 HealthCheckError"
+        except HealthCheckError as e:
+            assert nonexistent_batch in str(e)
+            print(f"  批次不存在错误: 正确抛出 ({e})")
+
+        print("[PASS] 缺文件/坏规则检查测试通过\n")
+
+    finally:
+        if "BANK_RECONCILE_HOME" in os.environ:
+            del os.environ["BANK_RECONCILE_HOME"]
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+
+def test_health_check_cross_restart():
+    print("=== 测试重启后再检查 ===")
+    samples_dir = os.path.join(os.path.dirname(__file__), "samples")
+    tmpdir = tempfile.mkdtemp(prefix="bank_reconcile_health_restart_")
+    os.environ["BANK_RECONCILE_HOME"] = tmpdir
+
+    try:
+        storage1 = BatchStorage(tmpdir)
+        audit1 = AuditStorage(tmpdir)
+
+        batch = Batch.create("重启测试批次")
+        storage1.save(batch)
+        batch_id = batch.batch_id
+
+        from click.testing import CliRunner
+        from bank_reconcile.cli import cli
+        runner = CliRunner()
+
+        r = runner.invoke(cli, ["import", "-b", batch_id, "-t", "bank",
+                            os.path.join(samples_dir, "bank_statement.csv")])
+        assert r.exit_code == 0
+        r = runner.invoke(cli, ["import", "-b", batch_id, "-t", "system",
+                            os.path.join(samples_dir, "system_receipt.csv")])
+        assert r.exit_code == 0
+        r = runner.invoke(cli, ["rules", "set", "-b", batch_id,
+                            os.path.join(samples_dir, "rules.yaml")])
+        assert r.exit_code == 0
+        r = runner.invoke(cli, ["match", "-b", batch_id])
+        assert r.exit_code == 0
+
+        report1 = run_health_check(storage1, batch_id)
+        print(f"  第一次检查状态: {report1.overall_status.value}")
+
+        del storage1
+        del audit1
+
+        storage2 = BatchStorage(tmpdir)
+        audit2 = AuditStorage(tmpdir)
+
+        batch_reloaded = storage2.load(batch_id)
+        assert batch_reloaded.batch_id == batch_id
+        print("  批次从磁盘重新加载: OK")
+
+        report2 = run_health_check(storage2, batch_id)
+        print(f"  重启后检查状态: {report2.overall_status.value}")
+
+        assert report2.batch_id == report1.batch_id
+        assert report2.batch_name == report1.batch_name
+        assert report2.batch_status == report1.batch_status
+
+        check_names1 = sorted(i.check_name for i in report1.issues)
+        check_names2 = sorted(i.check_name for i in report2.issues)
+        assert check_names1 == check_names2, "重启后检查项应一致"
+        print("  重启后检查项一致: OK")
+
+        levels1 = sorted(i.level.value for i in report1.issues)
+        levels2 = sorted(i.level.value for i in report2.issues)
+        assert levels1 == levels2, "重启后问题级别应一致"
+        print("  重启后问题级别一致: OK")
+
+        print("[PASS] 重启后再检查测试通过\n")
+
+    finally:
+        if "BANK_RECONCILE_HOME" in os.environ:
+            del os.environ["BANK_RECONCILE_HOME"]
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+
+def test_health_export_path_conflict():
+    print("=== 测试导出路径冲突 ===")
+    samples_dir = os.path.join(os.path.dirname(__file__), "samples")
+    tmpdir = tempfile.mkdtemp(prefix="bank_reconcile_health_conflict_")
+    os.environ["BANK_RECONCILE_HOME"] = tmpdir
+
+    try:
+        storage = BatchStorage(tmpdir)
+
+        batch = Batch.create("导出冲突测试")
+        storage.save(batch)
+        batch_id = batch.batch_id
+
+        from click.testing import CliRunner
+        from bank_reconcile.cli import cli
+        runner = CliRunner()
+
+        r = runner.invoke(cli, ["import", "-b", batch_id, "-t", "bank",
+                            os.path.join(samples_dir, "bank_statement.csv")])
+        assert r.exit_code == 0
+        r = runner.invoke(cli, ["import", "-b", batch_id, "-t", "system",
+                            os.path.join(samples_dir, "system_receipt.csv")])
+        assert r.exit_code == 0
+
+        output_path = os.path.join(tmpdir, "health_report.json")
+        with open(output_path, "w", encoding="utf-8") as f:
+            f.write("existing content")
+
+        r = runner.invoke(cli, ["health", "export", "-b", batch_id,
+                              "-o", output_path, "-f", "json"])
+        assert r.exit_code != 0, "文件存在且无 --force 应失败"
+        assert "已存在" in r.output or "exist" in r.output.lower()
+        print("  无 --force 时路径冲突正确拒绝: OK")
+
+        with open(output_path, "r", encoding="utf-8") as f:
+            content = f.read()
+        assert content == "existing content", "原文件不应被覆盖"
+        print("  冲突时原文件保持不变: OK")
+
+        audit = AuditStorage(tmpdir)
+        fail_records = audit.query(batch_id=batch_id, op_type="health_export_fail")
+        assert len(fail_records) >= 1, "导出失败应写入审计日志"
+        print("  导出失败审计记录: OK")
+
+        r = runner.invoke(cli, ["health", "export", "-b", batch_id,
+                              "-o", output_path, "-f", "json", "--force"])
+        assert r.exit_code == 0, f"加 --force 应成功: {r.output}"
+        with open(output_path, "r", encoding="utf-8") as f:
+            new_content = f.read()
+        assert "existing content" not in new_content
+        assert "batch_id" in new_content
+        print("  --force 正确覆盖: OK")
+
+        print("[PASS] 导出路径冲突测试通过\n")
+
+    finally:
+        if "BANK_RECONCILE_HOME" in os.environ:
+            del os.environ["BANK_RECONCILE_HOME"]
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+
+def test_health_export_json_csv_consistency():
+    print("=== 测试 JSON/CSV 内容一致 ===")
+    samples_dir = os.path.join(os.path.dirname(__file__), "samples")
+    tmpdir = tempfile.mkdtemp(prefix="bank_reconcile_health_consistency_")
+    os.environ["BANK_RECONCILE_HOME"] = tmpdir
+
+    try:
+        storage = BatchStorage(tmpdir)
+
+        batch = Batch.create("一致性测试批次")
+        storage.save(batch)
+        batch_id = batch.batch_id
+
+        from click.testing import CliRunner
+        from bank_reconcile.cli import cli
+        runner = CliRunner()
+
+        r = runner.invoke(cli, ["import", "-b", batch_id, "-t", "bank",
+                            os.path.join(samples_dir, "bank_statement.csv")])
+        assert r.exit_code == 0
+        r = runner.invoke(cli, ["import", "-b", batch_id, "-t", "system",
+                            os.path.join(samples_dir, "system_receipt.csv")])
+        assert r.exit_code == 0
+        r = runner.invoke(cli, ["rules", "set", "-b", batch_id,
+                            os.path.join(samples_dir, "rules.yaml")])
+        assert r.exit_code == 0
+        r = runner.invoke(cli, ["match", "-b", batch_id])
+        assert r.exit_code == 0
+
+        report = run_health_check(storage, batch_id)
+
+        json_path = os.path.join(tmpdir, "report.json")
+        csv_path = os.path.join(tmpdir, "report.csv")
+
+        export_health_report_json(report, json_path)
+        export_health_report_csv(report, csv_path)
+
+        assert os.path.isfile(json_path), "JSON 文件应存在"
+        assert os.path.isfile(csv_path), "CSV 文件应存在"
+        print("  JSON/CSV 均已生成: OK")
+
+        with open(json_path, "r", encoding="utf-8") as f:
+            json_data = json.load(f)
+
+        assert json_data["batch_id"] == batch_id
+        assert json_data["batch_name"] == "一致性测试批次"
+        assert "generated_at" in json_data
+        assert "overall_status" in json_data
+        assert "issues" in json_data
+        assert "summary" in json_data
+        print("  JSON 结构完整: OK")
+
+        import csv as csv_mod
+        with open(csv_path, "r", encoding="utf-8-sig", newline="") as f:
+            reader = csv_mod.DictReader(f)
+            csv_rows = list(reader)
+            csv_headers = reader.fieldnames
+
+        expected_headers = [
+            "batch_id", "batch_name", "batch_status", "generated_at",
+            "overall_status", "category", "check_name", "level",
+            "description", "suggestion",
+        ]
+        for h in expected_headers:
+            assert h in csv_headers, f"CSV 应包含列 {h}"
+        print("  CSV 表头完整: OK")
+
+        assert len(csv_rows) == len(report.issues), "CSV 行数应等于问题数"
+        print(f"  CSV 行数与问题数一致 ({len(csv_rows)} 行): OK")
+
+        assert json_data["batch_id"] == csv_rows[0]["batch_id"]
+        assert json_data["batch_name"] == csv_rows[0]["batch_name"]
+        assert json_data["batch_status"] == csv_rows[0]["batch_status"]
+        assert json_data["overall_status"] == csv_rows[0]["overall_status"]
+        print("  JSON/CSV 批次元数据一致: OK")
+
+        json_issue_names = sorted(i["check_name"] for i in json_data["issues"])
+        csv_issue_names = sorted(row["check_name"] for row in csv_rows)
+        assert json_issue_names == csv_issue_names, "JSON/CSV 检查项应一致"
+        print("  JSON/CSV 检查项一致: OK")
+
+        json_issue_levels = sorted(i["level"] for i in json_data["issues"])
+        csv_issue_levels = sorted(row["level"] for row in csv_rows)
+        assert json_issue_levels == csv_issue_levels, "JSON/CSV 问题级别应一致"
+        print("  JSON/CSV 问题级别一致: OK")
+
+        print("[PASS] JSON/CSV 内容一致性测试通过\n")
+
+    finally:
+        if "BANK_RECONCILE_HOME" in os.environ:
+            del os.environ["BANK_RECONCILE_HOME"]
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+
+def test_health_audit_records_queryable():
+    print("=== 测试审计记录可查询 ===")
+    samples_dir = os.path.join(os.path.dirname(__file__), "samples")
+    tmpdir = tempfile.mkdtemp(prefix="bank_reconcile_health_audit_")
+    os.environ["BANK_RECONCILE_HOME"] = tmpdir
+
+    try:
+        storage = BatchStorage(tmpdir)
+        audit = AuditStorage(tmpdir)
+
+        batch = Batch.create("审计测试批次")
+        storage.save(batch)
+        batch_id = batch.batch_id
+
+        from click.testing import CliRunner
+        from bank_reconcile.cli import cli
+        runner = CliRunner()
+
+        r = runner.invoke(cli, ["import", "-b", batch_id, "-t", "bank",
+                            os.path.join(samples_dir, "bank_statement.csv")])
+        assert r.exit_code == 0
+        r = runner.invoke(cli, ["import", "-b", batch_id, "-t", "system",
+                            os.path.join(samples_dir, "system_receipt.csv")])
+        assert r.exit_code == 0
+        r = runner.invoke(cli, ["rules", "set", "-b", batch_id,
+                            os.path.join(samples_dir, "rules.yaml")])
+        assert r.exit_code == 0
+        r = runner.invoke(cli, ["match", "-b", batch_id])
+        assert r.exit_code == 0
+
+        r = runner.invoke(cli, ["health", "check", "-b", batch_id])
+        assert r.exit_code == 0
+
+        r = runner.invoke(cli, ["health", "export", "-b", batch_id,
+                              "-o", os.path.join(tmpdir, "report1.json"), "-f", "json"])
+        assert r.exit_code == 0
+
+        r = runner.invoke(cli, ["health", "export", "-b", batch_id,
+                              "-o", os.path.join(tmpdir, "report1.csv"), "-f", "csv"])
+        assert r.exit_code == 0
+
+        all_health = audit.query(batch_id=batch_id)
+        health_types = {r["command"] for r in all_health if r["command"].startswith("health")}
+        print(f"  审计中健康相关操作类型: {health_types}")
+
+        assert "health_check" in health_types, "应有 health_check 记录"
+        assert "health_export" in health_types, "应有 health_export 记录"
+        print("  健康检查/导出操作已记录: OK")
+
+        check_records = audit.query(batch_id=batch_id, op_type="health_check")
+        assert len(check_records) >= 1
+        check0 = check_records[0]
+        assert check0["command"] == "health_check"
+        assert check0["batch_id"] == batch_id
+        assert "健康检查完成" in check0["summary"]
+        assert "timestamp" in check0
+        print(f"  health_check 记录详情: 影响数={check0['affected']}, 摘要={check0['summary'][:50]}...")
+
+        export_records = audit.query(batch_id=batch_id, op_type="health_export")
+        assert len(export_records) >= 2
+        for rec in export_records:
+            assert rec["command"] == "health_export"
+            assert rec["batch_id"] == batch_id
+            assert "健康报告导出成功" in rec["summary"]
+        print(f"  health_export 记录数: {len(export_records)}")
+
+        nonexistent_output = os.path.join(tmpdir, "existing.txt")
+        with open(nonexistent_output, "w") as f:
+            f.write("existing")
+        r = runner.invoke(cli, ["health", "export", "-b", batch_id,
+                              "-o", nonexistent_output, "-f", "json"])
+        assert r.exit_code != 0
+
+        fail_records = audit.query(batch_id=batch_id, op_type="health_export_fail")
+        assert len(fail_records) >= 1
+        print(f"  health_export_fail 记录数: {len(fail_records)}")
+
+        r = runner.invoke(cli, ["audit-log", "-b", batch_id, "-t", "health_check"])
+        assert r.exit_code == 0
+        assert "health_check" in r.output
+        print("  audit-log 可查询 health_check: OK")
+
+        print("[PASS] 审计记录可查询测试通过\n")
+
+    finally:
+        if "BANK_RECONCILE_HOME" in os.environ:
+            del os.environ["BANK_RECONCILE_HOME"]
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+
 def main():
     try:
         test_parser()
@@ -3650,6 +4139,12 @@ def main():
         test_snapshot_conflict_strategies()
         test_snapshot_corrupted_rejected()
         test_snapshot_export_consistency_and_audit()
+        test_health_check_healthy_batch()
+        test_health_check_missing_files_bad_rules()
+        test_health_check_cross_restart()
+        test_health_export_path_conflict()
+        test_health_export_json_csv_consistency()
+        test_health_audit_records_queryable()
         print("=" * 50)
         print("所有测试通过！")
         print("=" * 50)
