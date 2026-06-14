@@ -8,7 +8,7 @@ from contextlib import redirect_stdout
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from bank_reconcile.models import Batch, FileType, DiscrepancyStatus, DiscrepancyType
+from bank_reconcile.models import Batch, FileType, DiscrepancyStatus, DiscrepancyType, AdjustmentType
 from bank_reconcile.parser import parse_csv, parse_xlsx, parse_file
 from bank_reconcile.rules import load_rules, RuleValidationError, MatchRules
 from bank_reconcile.matcher import run_matching
@@ -974,6 +974,327 @@ def test_close_block_mark_rollback_match():
         shutil.rmtree(tmpdir, ignore_errors=True)
 
 
+def test_manual_diff_sort():
+    """验证1: diff 列出未匹配且排序正确."""
+    print("=== 验证1: diff 列出未匹配且排序正确 ===")
+    samples_dir = os.path.join(os.path.dirname(__file__), "samples")
+    tmpdir = tempfile.mkdtemp(prefix="bank_reconcile_diff_test_")
+
+    try:
+        os.environ["BANK_RECONCILE_HOME"] = tmpdir
+
+        from click.testing import CliRunner
+        from bank_reconcile.cli import cli, _build_diff_rows
+
+        runner = CliRunner()
+
+        def check(desc, result, expected_exit=0):
+            assert result.exit_code == expected_exit, \
+                f"[{desc}] 退出码 {result.exit_code}, 期望 {expected_exit}, stdout={result.output}"
+            print(f"  [OK] {desc}: exit={expected_exit}")
+
+        r = runner.invoke(cli, ["create", "diff排序测试"])
+        check("create", r)
+        batch_line = [ln for ln in r.output.splitlines() if "BATCH-" in ln][0]
+        batch_id = batch_line.split("(ID: ")[1].rstrip(")").strip()
+
+        r = runner.invoke(cli, ["import", "-b", batch_id, "-t", "bank",
+                            os.path.join(samples_dir, "bank_statement.csv")])
+        check("import bank", r)
+
+        r = runner.invoke(cli, ["import", "-b", batch_id, "-t", "system",
+                            os.path.join(samples_dir, "system_receipt.csv")])
+        check("import system", r)
+
+        r = runner.invoke(cli, ["match", "-b", batch_id])
+        check("match", r)
+
+        storage = BatchStorage(tmpdir)
+        batch = storage.load(batch_id)
+
+        diff_rows = _build_diff_rows(batch)
+        assert len(diff_rows) > 0, "应该有未匹配记录"
+        print(f"  diff 记录数: {len(diff_rows)}")
+
+        sort_keys = [r["sort_key"] for r in diff_rows]
+        assert sort_keys == sorted(sort_keys), "记录应按金额差从小到大排序"
+        print(f"  排序验证: {[f'{k:.2f}' for k in sort_keys]}")
+
+        for row in diff_rows:
+            assert "bank_txn" in row
+            assert "system_txn" in row
+            assert "amount_diff" in row
+            assert "date_diff" in row
+            assert row["amount_diff"] >= 0
+        print("  每条记录包含 bank_txn/system_txn/amount_diff/date_diff: OK")
+
+        r = runner.invoke(cli, ["diff", "-b", batch_id, "-n", "10"])
+        check("diff CLI", r)
+        assert "未匹配记录" in r.output
+        assert "金额差" in r.output
+        assert "日期差" in r.output
+        print("  diff CLI 输出包含预期字段: OK")
+
+        csv_path = os.path.join(tmpdir, "diff_export.csv")
+        r = runner.invoke(cli, ["diff", "-b", batch_id, "--export", csv_path])
+        check("diff --export", r)
+        assert os.path.isfile(csv_path), "CSV 文件应落盘"
+
+        with open(csv_path, "r", encoding="utf-8-sig") as f:
+            import csv
+            reader = csv.DictReader(f)
+            headers = reader.fieldnames
+            rows = list(reader)
+
+        assert "金额差异" in headers, "CSV 应包含金额差异列"
+        assert "日期偏差(天)" in headers, "CSV 应包含日期偏差列"
+        assert len(rows) == len(diff_rows), "CSV 行数应匹配 diff 记录数"
+        print(f"  CSV 导出验证: {len(rows)} 行, 字段完整")
+
+        csv_amounts = [float(r["金额差异"]) for r in rows]
+        assert csv_amounts == sorted(csv_amounts), "CSV 也应按金额差排序"
+        print("  CSV 排序正确: OK")
+
+        print("[PASS] 验证1 (diff 列出未匹配且排序正确) 通过\n")
+
+    finally:
+        if "BANK_RECONCILE_HOME" in os.environ:
+            del os.environ["BANK_RECONCILE_HOME"]
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+
+def test_manual_link_adjustment():
+    """验证2: manual-link 后 adjustment 入库字段值对."""
+    print("=== 验证2: manual-link 后 adjustment 入库字段值对 ===")
+    samples_dir = os.path.join(os.path.dirname(__file__), "samples")
+    tmpdir = tempfile.mkdtemp(prefix="bank_reconcile_manual_link_test_")
+
+    try:
+        os.environ["BANK_RECONCILE_HOME"] = tmpdir
+
+        from click.testing import CliRunner
+        from bank_reconcile.cli import cli
+
+        runner = CliRunner()
+
+        def check(desc, result, expected_exit=0):
+            assert result.exit_code == expected_exit, \
+                f"[{desc}] 退出码 {result.exit_code}, 期望 {expected_exit}, stdout={result.output}" \
+                + (f"\nexception={result.exception}" if result.exception else "")
+            print(f"  [OK] {desc}: exit={expected_exit}")
+
+        r = runner.invoke(cli, ["create", "手工关联测试"])
+        check("create", r)
+        batch_line = [ln for ln in r.output.splitlines() if "BATCH-" in ln][0]
+        batch_id = batch_line.split("(ID: ")[1].rstrip(")").strip()
+
+        r = runner.invoke(cli, ["import", "-b", batch_id, "-t", "bank",
+                            os.path.join(samples_dir, "bank_statement.csv")])
+        check("import bank", r)
+
+        r = runner.invoke(cli, ["import", "-b", batch_id, "-t", "system",
+                            os.path.join(samples_dir, "system_receipt.csv")])
+        check("import system", r)
+
+        r = runner.invoke(cli, ["match", "-b", batch_id])
+        check("match", r)
+
+        storage = BatchStorage(tmpdir)
+        batch_before = storage.load(batch_id)
+        adj_count_before = len(batch_before.adjustment_txns)
+        print(f"  关联前 adjustment 数量: {adj_count_before}")
+
+        bank_txn_id = "B004"
+        system_txn_id = "B004"
+        adj_type = "amount_rounding"
+        reviewer = "tester_manual"
+        note = "金额四舍五入差异"
+
+        r = runner.invoke(cli, [
+            "manual-link",
+            "-b", batch_id,
+            "--bank-txn-id", bank_txn_id,
+            "--system-txn-id", system_txn_id,
+            "-t", adj_type,
+            "-r", reviewer,
+            "-n", note,
+        ])
+        check("manual-link", r)
+
+        batch_after = storage.load(batch_id)
+
+        assert len(batch_after.adjustment_txns) == adj_count_before + 1, "应新增一条 adjustment"
+        new_adj = batch_after.adjustment_txns[-1]
+        print(f"  新增 adjustment: {new_adj.txn_id}")
+
+        assert new_adj.txn_id.startswith("ADJ-"), "adjustment ID 应以 ADJ- 开头"
+        assert new_adj.file_type == FileType.MANUAL_ADJUSTMENT
+        assert new_adj.source_file == "manual_link"
+        assert new_adj.counterparty == "手工关联"
+        assert new_adj.currency == "CNY"
+
+        bank_txn = next(t for t in batch_after.bank_txns if t.txn_id == bank_txn_id)
+        system_txn = next(t for t in batch_after.system_txns if t.txn_id == system_txn_id)
+        expected_amount_diff = system_txn.amount - bank_txn.amount
+        assert abs(new_adj.amount - expected_amount_diff) < 1e-9, \
+            f"adjustment 金额应为 {expected_amount_diff}, 实际 {new_adj.amount}"
+        print(f"  adjustment 金额验证: {new_adj.amount:.2f} (银行 {bank_txn.amount}, 系统 {system_txn.amount})")
+
+        assert new_adj.raw_data["adjustment_type"] == adj_type
+        assert new_adj.raw_data["bank_txn_id"] == bank_txn_id
+        assert new_adj.raw_data["system_txn_id"] == system_txn_id
+        assert new_adj.raw_data["reviewer"] == reviewer
+        assert new_adj.raw_data["note"] == note
+        print(f"  raw_data 字段验证: adjustment_type={new_adj.raw_data['adjustment_type']}, reviewer={new_adj.raw_data['reviewer']}")
+
+        linked_disp = None
+        for d in batch_after.discrepancies:
+            if d.bank_txn and d.system_txn and d.adjustment_txn:
+                if d.bank_txn.txn_id == bank_txn_id and d.system_txn.txn_id == system_txn_id:
+                    linked_disp = d
+                    break
+        assert linked_disp is not None, "应生成关联的差异记录"
+        assert linked_disp.status == DiscrepancyStatus.CONFIRMED
+        assert linked_disp.reviewer == reviewer
+        assert linked_disp.note == note
+        assert linked_disp.adjustment_txn.txn_id == new_adj.txn_id
+        print(f"  差异记录验证: {linked_disp.discrepancy_id}, status={linked_disp.status.value}")
+
+        assert len(batch_after.manual_link_history) == 1, "应记录手工关联历史"
+        history = batch_after.manual_link_history[0]
+        assert history["bank_txn_id"] == bank_txn_id
+        assert history["system_txn_id"] == system_txn_id
+        assert history["adjustment_type"] == adj_type
+        assert history["adjustment_txn_id"] == new_adj.txn_id
+        assert history["discrepancy_id"] == linked_disp.discrepancy_id
+        print(f"  历史记录验证: adjustment_txn_id={history['adjustment_txn_id']}")
+
+        audit = AuditStorage(tmpdir)
+        audit_records = audit.query(op_type="manual_link")
+        assert len(audit_records) >= 1, "应写入审计日志"
+        assert reviewer in audit_records[0]["summary"]
+        assert adj_type in audit_records[0]["summary"]
+        print(f"  审计日志验证: {audit_records[0]['summary']}")
+
+        print("[PASS] 验证2 (manual-link 后 adjustment 入库字段值对) 通过\n")
+
+    finally:
+        if "BANK_RECONCILE_HOME" in os.environ:
+            del os.environ["BANK_RECONCILE_HOME"]
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+
+def test_undo_manual_link():
+    """验证3: undo 后再次 diff 确认关联已还原."""
+    print("=== 验证3: undo 后再次 diff 确认关联已还原 ===")
+    samples_dir = os.path.join(os.path.dirname(__file__), "samples")
+    tmpdir = tempfile.mkdtemp(prefix="bank_reconcile_undo_test_")
+
+    try:
+        os.environ["BANK_RECONCILE_HOME"] = tmpdir
+
+        from click.testing import CliRunner
+        from bank_reconcile.cli import cli, _build_diff_rows
+
+        runner = CliRunner()
+
+        def check(desc, result, expected_exit=0):
+            assert result.exit_code == expected_exit, \
+                f"[{desc}] 退出码 {result.exit_code}, 期望 {expected_exit}, stdout={result.output}" \
+                + (f"\nexception={result.exception}" if result.exception else "")
+            print(f"  [OK] {desc}: exit={expected_exit}")
+
+        r = runner.invoke(cli, ["create", "undo测试"])
+        check("create", r)
+        batch_line = [ln for ln in r.output.splitlines() if "BATCH-" in ln][0]
+        batch_id = batch_line.split("(ID: ")[1].rstrip(")").strip()
+
+        r = runner.invoke(cli, ["import", "-b", batch_id, "-t", "bank",
+                            os.path.join(samples_dir, "bank_statement.csv")])
+        check("import bank", r)
+
+        r = runner.invoke(cli, ["import", "-b", batch_id, "-t", "system",
+                            os.path.join(samples_dir, "system_receipt.csv")])
+        check("import system", r)
+
+        r = runner.invoke(cli, ["match", "-b", batch_id])
+        check("match", r)
+
+        storage = BatchStorage(tmpdir)
+        batch_initial = storage.load(batch_id)
+        diff_rows_before = _build_diff_rows(batch_initial)
+        adj_count_before = len(batch_initial.adjustment_txns)
+        disp_count_before = len(batch_initial.discrepancies)
+        print(f"  关联前: diff={len(diff_rows_before)} 条, adj={adj_count_before} 条, disp={disp_count_before} 条")
+
+        bank_txn_id = "B004"
+        system_txn_id = "B004"
+        r = runner.invoke(cli, [
+            "manual-link",
+            "-b", batch_id,
+            "--bank-txn-id", bank_txn_id,
+            "--system-txn-id", system_txn_id,
+            "-t", "timing_diff",
+            "-r", "undo_tester",
+            "-n", "日期差异",
+        ])
+        check("manual-link", r)
+
+        batch_after_link = storage.load(batch_id)
+        diff_rows_after_link = _build_diff_rows(batch_after_link)
+        print(f"  关联后: diff={len(diff_rows_after_link)} 条, adj={len(batch_after_link.adjustment_txns)} 条")
+        assert len(diff_rows_after_link) < len(diff_rows_before), "关联后 diff 记录应减少"
+
+        r = runner.invoke(cli, ["undo", "-b", batch_id])
+        check("undo", r)
+        assert "已撤销" in r.output
+
+        batch_after_undo = storage.load(batch_id)
+        diff_rows_after_undo = _build_diff_rows(batch_after_undo)
+        adj_count_after_undo = len(batch_after_undo.adjustment_txns)
+        disp_count_after_undo = len(batch_after_undo.discrepancies)
+        print(f"  undo后: diff={len(diff_rows_after_undo)} 条, adj={adj_count_after_undo} 条, disp={disp_count_after_undo} 条")
+
+        assert adj_count_after_undo == adj_count_before, \
+            f"undo 后 adjustment 数量应恢复为 {adj_count_before}, 实际 {adj_count_after_undo}"
+        print(f"  adjustment 数量恢复: {adj_count_before} -> {len(batch_after_link.adjustment_txns)} -> {adj_count_after_undo}")
+
+        assert disp_count_after_undo == disp_count_before, \
+            f"undo 后 discrepancy 数量应恢复为 {disp_count_before}, 实际 {disp_count_after_undo}"
+        print(f"  discrepancy 数量恢复: {disp_count_before} -> {len(batch_after_link.discrepancies)} -> {disp_count_after_undo}")
+
+        assert len(batch_after_undo.manual_link_history) == 0, \
+            f"undo 后历史记录应清空, 实际剩余 {len(batch_after_undo.manual_link_history)} 条"
+
+        assert len(diff_rows_after_undo) == len(diff_rows_before), \
+            f"undo 后 diff 记录数应恢复为 {len(diff_rows_before)}, 实际 {len(diff_rows_after_undo)}"
+        print(f"  diff 记录数恢复: {len(diff_rows_before)} -> {len(diff_rows_after_link)} -> {len(diff_rows_after_undo)}")
+
+        sort_keys_before = [r["sort_key"] for r in diff_rows_before]
+        sort_keys_after_undo = [r["sort_key"] for r in diff_rows_after_undo]
+        assert sort_keys_before == sort_keys_after_undo, "undo 后 diff 排序应与关联前一致"
+        print("  undo 后 diff 排序与关联前一致: OK")
+
+        audit = AuditStorage(tmpdir)
+        undo_audit = audit.query(op_type="undo_manual_link")
+        assert len(undo_audit) >= 1, "应写入 undo 审计日志"
+        assert bank_txn_id in undo_audit[0]["summary"]
+        assert system_txn_id in undo_audit[0]["summary"]
+        print(f"  undo 审计日志验证: {undo_audit[0]['summary']}")
+
+        r = runner.invoke(cli, ["undo", "-b", batch_id])
+        check("undo (无历史时)", r)
+        assert "没有可撤销" in r.output
+        print("  无历史时 undo 给出正确提示: OK")
+
+        print("[PASS] 验证3 (undo 后再次 diff 确认关联已还原) 通过\n")
+
+    finally:
+        if "BANK_RECONCILE_HOME" in os.environ:
+            del os.environ["BANK_RECONCILE_HOME"]
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+
 def main():
     try:
         test_parser()
@@ -991,6 +1312,9 @@ def main():
         test_close_reopen_import_block()
         test_xlsx_import_field_values()
         test_close_block_mark_rollback_match()
+        test_manual_diff_sort()
+        test_manual_link_adjustment()
+        test_undo_manual_link()
         print("=" * 50)
         print("所有测试通过！")
         print("=" * 50)

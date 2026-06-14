@@ -31,6 +31,14 @@ class DiscrepancyStatus(str, Enum):
     IGNORED = "ignored"
 
 
+class AdjustmentType(str, Enum):
+    """手工调整类型."""
+    TIMING_DIFF = "timing_diff"
+    AMOUNT_ROUNDING = "amount_rounding"
+    MANUAL_MATCH = "manual_match"
+    WRITE_OFF = "write_off"
+
+
 class BatchStatus(str, Enum):
     """批次状态."""
     OPEN = "open"
@@ -171,6 +179,7 @@ class Batch:
     adjustment_txns: List[Transaction] = field(default_factory=list)
     discrepancies: List[Discrepancy] = field(default_factory=list)
     exports: List[Dict[str, Any]] = field(default_factory=list)
+    manual_link_history: List[Dict[str, Any]] = field(default_factory=list)
 
     @property
     def is_closed(self) -> bool:
@@ -220,6 +229,7 @@ class Batch:
             "adjustment_txns": [t.to_dict() for t in self.adjustment_txns],
             "discrepancies": [d.to_dict() for d in self.discrepancies],
             "exports": self.exports,
+            "manual_link_history": self.manual_link_history,
         }
 
     @classmethod
@@ -276,4 +286,5 @@ class Batch:
             adjustment_txns=[txn_from_dict(t) for t in data.get("adjustment_txns", [])],
             discrepancies=[disp_from_dict(d) for d in data.get("discrepancies", [])],
             exports=data.get("exports", []),
+            manual_link_history=data.get("manual_link_history", []),
         )
