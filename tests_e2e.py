@@ -14,6 +14,8 @@ from bank_reconcile.rules import load_rules, RuleValidationError, MatchRules
 from bank_reconcile.matcher import run_matching
 from bank_reconcile.storage import BatchStorage
 from bank_reconcile.report import export_discrepancies_csv, generate_summary
+from bank_reconcile.audit import AuditStorage
+from bank_reconcile.config import load_config, save_config
 
 
 def test_parser():
@@ -393,6 +395,293 @@ def test_cli_rich_output():
         shutil.rmtree(tmpdir, ignore_errors=True)
 
 
+def test_audit_unit():
+    print("=== 测试审计模块（单元） ===")
+    tmpdir = tempfile.mkdtemp(prefix="bank_reconcile_audit_")
+
+    try:
+        audit = AuditStorage(tmpdir)
+        assert os.path.isfile(os.path.join(tmpdir, "audit.db")), "SQLite 数据库应自动创建"
+        print("  数据库自动创建: OK")
+
+        rid = audit.log("import", "BATCH-TEST01", 34, "导入 bank_statement.csv，银行回单 34 条")
+        assert rid > 0, "log 应返回正整数 ID"
+        print(f"  写入审计记录: id={rid}")
+
+        audit.log("match", "BATCH-TEST01", 6, "匹配完成，差异 6 条")
+        audit.log("mark", "BATCH-TEST01", 1, "标记 DISP-XXX 为 confirmed")
+        audit.log("rollback", "BATCH-TEST01", 1, "回滚 DISP-XXX")
+
+        all_records = audit.query()
+        assert len(all_records) == 4, f"应有 4 条记录, 实际 {len(all_records)}"
+        print(f"  查询全部: {len(all_records)} 条")
+
+        import_records = audit.query(op_type="import")
+        assert len(import_records) == 1, f"import 应 1 条, 实际 {len(import_records)}"
+        assert import_records[0]["command"] == "import"
+        assert import_records[0]["affected"] == 34
+        assert "银行回单 34 条" in import_records[0]["summary"]
+        print(f"  按类型过滤 import: {len(import_records)} 条")
+
+        batch_records = audit.query(batch_id="BATCH-TEST01")
+        assert len(batch_records) == 4
+        print(f"  按批次过滤: {len(batch_records)} 条")
+
+        csv_path = os.path.join(tmpdir, "audit_export.csv")
+        count = audit.export_csv(csv_path, all_records)
+        assert count == 4
+        assert os.path.isfile(csv_path)
+        with open(csv_path, "r", encoding="utf-8-sig") as f:
+            import csv
+            reader = csv.DictReader(f)
+            rows = list(reader)
+            assert len(rows) == 4
+            assert "id" in rows[0]
+            assert "timestamp" in rows[0]
+            assert "command" in rows[0]
+            assert "batch_id" in rows[0]
+            assert "affected" in rows[0]
+            assert "summary" in rows[0]
+        print(f"  CSV 导出: {count} 条, 字段完整")
+
+        json_path = os.path.join(tmpdir, "audit_export.json")
+        count = audit.export_json(json_path, all_records)
+        assert count == 4
+        assert os.path.isfile(json_path)
+        with open(json_path, "r", encoding="utf-8") as f:
+            import json
+            data = json.load(f)
+            assert len(data) == 4
+            cmds = {d["command"] for d in data}
+            assert cmds == {"import", "match", "mark", "rollback"}
+        print(f"  JSON 导出: {count} 条")
+
+        audit.log("import", "BATCH-OLD", 10, "旧记录")
+        deleted = audit.cleanup(0)
+        assert deleted == 0, "retention_days=0 不应删除任何记录"
+        print("  cleanup(0): 不删除")
+
+        deleted = audit.cleanup(90)
+        assert deleted >= 0, "cleanup 应返回非负整数"
+        print(f"  cleanup(90): 删除 {deleted} 条")
+
+        all_after = audit.query()
+        assert len(all_after) <= 5
+        print(f"  清理后剩余: {len(all_after)} 条")
+
+        print("[PASS] 审计模块单元测试通过\n")
+
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+
+def test_audit_config():
+    print("=== 测试配置模块 ===")
+    tmpdir = tempfile.mkdtemp(prefix="bank_reconcile_cfg_")
+
+    try:
+        cfg = load_config(tmpdir)
+        assert cfg["audit_retention_days"] == 90, f"默认应为 90, 实际 {cfg['audit_retention_days']}"
+        print(f"  默认配置: audit_retention_days={cfg['audit_retention_days']}")
+
+        cfg["audit_retention_days"] = 30
+        save_config(tmpdir, cfg)
+
+        cfg2 = load_config(tmpdir)
+        assert cfg2["audit_retention_days"] == 30
+        print(f"  修改后配置: audit_retention_days={cfg2['audit_retention_days']}")
+
+        print("[PASS] 配置模块测试通过\n")
+
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+
+def test_audit_cli_integration():
+    print("=== 测试审计 CLI 集成 ===")
+    samples_dir = os.path.join(os.path.dirname(__file__), "samples")
+    tmpdir = tempfile.mkdtemp(prefix="bank_reconcile_audit_cli_")
+
+    try:
+        os.environ["BANK_RECONCILE_HOME"] = tmpdir
+
+        from click.testing import CliRunner
+        from bank_reconcile.cli import cli
+
+        runner = CliRunner()
+
+        def check(desc, result, expected_exit=0):
+            assert result.exit_code == expected_exit, f"[{desc}] 退出码 {result.exit_code}, 期望 {expected_exit}, stdout={result.output}"
+            if result.exception:
+                import traceback
+                tb = "".join(traceback.format_exception(type(result.exception), result.exception, result.exception.__traceback__))
+                raise AssertionError(f"[{desc}] 抛出异常: {result.exception}\n{tb}")
+            print(f"  [OK] {desc}")
+
+        r = runner.invoke(cli, ["create", "audit_test"])
+        check("create", r)
+        batch_line = [ln for ln in r.output.splitlines() if "BATCH-" in ln][0]
+        batch_id = batch_line.split("(ID: ")[1].rstrip(")").strip()
+
+        r = runner.invoke(cli, ["import", "-b", batch_id, "-t", "bank",
+                            os.path.join(samples_dir, "bank_statement.csv")])
+        check("import bank", r)
+
+        r = runner.invoke(cli, ["import", "-b", batch_id, "-t", "system",
+                            os.path.join(samples_dir, "system_receipt.csv")])
+        check("import system", r)
+
+        r = runner.invoke(cli, ["import", "-b", batch_id, "-t", "adjustment",
+                            os.path.join(samples_dir, "manual_adjustment.csv")])
+        check("import adjustment", r)
+
+        r = runner.invoke(cli, ["rules", "-b", batch_id,
+                            os.path.join(samples_dir, "rules.yaml")])
+        check("rules", r)
+
+        r = runner.invoke(cli, ["match", "-b", batch_id])
+        check("match", r)
+
+        storage = BatchStorage(tmpdir)
+        b = storage.load(batch_id)
+        first_disp_id = b.discrepancies[0].discrepancy_id
+
+        r = runner.invoke(cli, ["mark", "-b", batch_id, "-d", first_disp_id,
+                              "-s", "confirmed", "-r", "audit_tester", "-n", "审计测试"])
+        check("mark confirmed", r)
+
+        r = runner.invoke(cli, ["rollback", "-b", batch_id, "-d", first_disp_id])
+        check("rollback", r)
+
+        audit = AuditStorage(tmpdir)
+        all_records = audit.query()
+        assert len(all_records) >= 6, f"应有至少 6 条审计记录(import×3 + match + mark + rollback), 实际 {len(all_records)}"
+        print(f"  审计记录数: {len(all_records)}")
+
+        commands = {r["command"] for r in all_records}
+        assert "import" in commands, "应包含 import 操作"
+        assert "match" in commands, "应包含 match 操作"
+        assert "mark" in commands, "应包含 mark 操作"
+        assert "rollback" in commands, "应包含 rollback 操作"
+        print(f"  操作类型: {sorted(commands)}")
+
+        import_records = audit.query(op_type="import")
+        assert len(import_records) == 3, f"应有 3 条 import 记录, 实际 {len(import_records)}"
+        print(f"  import 记录: {len(import_records)} 条")
+
+        batch_records = audit.query(batch_id=batch_id)
+        assert len(batch_records) == len(all_records), "按批次过滤应返回全部"
+        print(f"  按批次过滤: {len(batch_records)} 条")
+
+        r = runner.invoke(cli, ["audit-log"])
+        check("audit-log (no filter)", r)
+        assert "审计日志" in r.output
+
+        r = runner.invoke(cli, ["audit-log", "--type", "import"])
+        check("audit-log --type import", r)
+
+        r = runner.invoke(cli, ["audit-log", "-b", batch_id])
+        check("audit-log -b", r)
+
+        csv_export = os.path.join(tmpdir, "audit_cli_export.csv")
+        r = runner.invoke(cli, ["audit-log", "-o", csv_export, "-f", "csv"])
+        check("audit-log export csv", r)
+        assert os.path.isfile(csv_export), "CSV 审计导出文件应落盘"
+        with open(csv_export, "r", encoding="utf-8-sig") as f:
+            import csv
+            reader = csv.DictReader(f)
+            rows = list(reader)
+            assert len(rows) >= 6
+            assert "id" in rows[0]
+            assert "timestamp" in rows[0]
+            assert "command" in rows[0]
+            assert "batch_id" in rows[0]
+            assert "affected" in rows[0]
+            assert "summary" in rows[0]
+        print(f"  CSV 导出: {len(rows)} 条, 字段完整 (与 report 导出风格对齐)")
+
+        json_export = os.path.join(tmpdir, "audit_cli_export.json")
+        r = runner.invoke(cli, ["audit-log", "-o", json_export, "-f", "json"])
+        check("audit-log export json", r)
+        assert os.path.isfile(json_export)
+        with open(json_export, "r", encoding="utf-8") as f:
+            import json
+            data = json.load(f)
+            assert len(data) >= 6
+            assert data[0]["command"] in ("import", "match", "mark", "rollback")
+        print(f"  JSON 导出: {len(data)} 条")
+
+        import_records_summary = [r for r in all_records if r["command"] == "import"]
+        for rec in import_records_summary:
+            assert "导入" in rec["summary"], f"import 摘要应包含'导入', 实际: {rec['summary']}"
+        print("  import 摘要格式验证通过")
+
+        print("[PASS] 审计 CLI 集成测试通过\n")
+
+    finally:
+        if "BANK_RECONCILE_HOME" in os.environ:
+            del os.environ["BANK_RECONCILE_HOME"]
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+
+def test_audit_persistence():
+    print("=== 测试审计数据持久化（重启不丢） ===")
+    tmpdir = tempfile.mkdtemp(prefix="bank_reconcile_audit_persist_")
+
+    try:
+        audit1 = AuditStorage(tmpdir)
+        audit1.log("import", "BATCH-P1", 25, "第一次写入")
+        audit1.log("match", "BATCH-P1", 3, "匹配3条")
+
+        records1 = audit1.query()
+        assert len(records1) == 2
+        print(f"  第一次实例: {len(records1)} 条")
+
+        audit2 = AuditStorage(tmpdir)
+        records2 = audit2.query()
+        assert len(records2) == 2, "重新创建实例后数据应保留"
+        audit2.log("mark", "BATCH-P1", 1, "标记1条")
+
+        records3 = audit2.query()
+        assert len(records3) == 3
+        print(f"  第二次实例: {len(records3)} 条（含新增）")
+
+        print("[PASS] 审计持久化测试通过\n")
+
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+
+def test_audit_retention_cleanup():
+    print("=== 测试审计保留天数自动清理 ===")
+    tmpdir = tempfile.mkdtemp(prefix="bank_reconcile_audit_ret_")
+
+    try:
+        audit = AuditStorage(tmpdir)
+        audit.log("import", "BATCH-R1", 10, "近期记录")
+
+        cfg = load_config(tmpdir)
+        assert cfg["audit_retention_days"] == 90
+        cfg["audit_retention_days"] = 1
+        save_config(tmpdir, cfg)
+        cfg_reload = load_config(tmpdir)
+        assert cfg_reload["audit_retention_days"] == 1
+        print("  配置 audit_retention_days=1 写入验证通过")
+
+        deleted = audit.cleanup(1)
+        print(f"  cleanup(1): 删除 {deleted} 条 (当天记录不会被删)")
+
+        audit.log("import", "BATCH-R2", 5, "另一条记录")
+        records = audit.query()
+        assert len(records) >= 1
+        print(f"  清理后正常写入: {len(records)} 条")
+
+        print("[PASS] 审计保留天数清理测试通过\n")
+
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+
 def main():
     try:
         test_parser()
@@ -402,6 +691,11 @@ def main():
         test_source_traceability()
         test_error_paths()
         test_cli_rich_output()
+        test_audit_unit()
+        test_audit_config()
+        test_audit_cli_integration()
+        test_audit_persistence()
+        test_audit_retention_cleanup()
         print("=" * 50)
         print("所有测试通过！")
         print("=" * 50)

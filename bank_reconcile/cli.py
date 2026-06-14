@@ -16,6 +16,8 @@ from .rules import load_rules, RuleValidationError
 from .matcher import run_matching
 from .storage import BatchStorage
 from .report import export_discrepancies_csv, export_summary_csv, generate_summary
+from .audit import AuditStorage
+from .config import load_config
 
 
 console = Console(highlight=False, emoji=False, markup=True)
@@ -24,6 +26,20 @@ console = Console(highlight=False, emoji=False, markup=True)
 def _get_storage() -> BatchStorage:
     storage_dir = os.environ.get("BANK_RECONCILE_HOME")
     return BatchStorage(storage_dir)
+
+
+def _get_audit(storage: BatchStorage) -> AuditStorage:
+    return AuditStorage(storage.storage_dir)
+
+
+def _maybe_cleanup_audit(audit: AuditStorage, storage: BatchStorage) -> None:
+    cfg = load_config(storage.storage_dir)
+    days = cfg.get("audit_retention_days", 90)
+    if days and days > 0:
+        try:
+            audit.cleanup(days)
+        except Exception:
+            pass
 
 
 def _print_batch_info(batch: Batch) -> None:
@@ -151,6 +167,14 @@ def import_file(batch_id: str, file_type: str, file_path: str) -> None:
         if len(result.duplicates) > 5:
             console.print(f"    ... 还有 {len(result.duplicates) - 5} 条重复")
 
+    file_basename = os.path.basename(file_path)
+    summary_text = (
+        f"导入 {file_basename}，{type_name} {result.row_count} 条"
+    )
+    audit = _get_audit(storage)
+    audit.log("import", batch_id, result.row_count, summary_text)
+    _maybe_cleanup_audit(audit, storage)
+
 
 # ── rules ─────────────────────────────────────────────────
 @cli.command(help="为批次设置规则文件")
@@ -218,6 +242,16 @@ def match(batch_id: str, rule_file: Optional[str]) -> None:
     console.print(f"[green]OK[/] 匹配完成，共发现 [bold]{len(discrepancies)}[/] 条差异")
     for t, c in sorted(by_type.items()):
         console.print(f"  {t}: {c}")
+
+    bank_count = len(batch.bank_txns)
+    sys_count = len(batch.system_txns)
+    summary_text = (
+        f"执行对账匹配，银行回单 {bank_count} 条，系统流水 {sys_count} 条，"
+        f"差异 {len(discrepancies)} 条"
+    )
+    audit = _get_audit(storage)
+    audit.log("match", batch_id, len(discrepancies), summary_text)
+    _maybe_cleanup_audit(audit, storage)
 
 
 # ── discrepancies (list differences) ──────────────────────
@@ -302,6 +336,15 @@ def mark(batch_id: str, discrepancy_id: str, status: str, reviewer: str, note: s
     found.mark(target_status, reviewer, note)
     storage.save(batch)
 
+    summary_text = (
+        f"标记 {discrepancy_id} 为 {status}，复核人 {reviewer}"
+    )
+    if note:
+        summary_text += f"，备注: {note}"
+    audit = _get_audit(storage)
+    audit.log("mark", batch_id, 1, summary_text)
+    _maybe_cleanup_audit(audit, storage)
+
     console.print(f"[green]OK[/] 已标记 {discrepancy_id} 为 [bold]{status}[/]")
     console.print(f"  复核人: {reviewer}")
     if note:
@@ -332,6 +375,9 @@ def rollback(batch_id: str, discrepancy_id: str) -> None:
 
     if found.rollback():
         storage.save(batch)
+        audit = _get_audit(storage)
+        audit.log("rollback", batch_id, 1, f"回滚 {discrepancy_id}，当前状态 {found.status.value}")
+        _maybe_cleanup_audit(audit, storage)
         console.print(f"[green]OK[/] 已回滚 {discrepancy_id}，当前状态: [bold]{found.status.value}[/]")
     else:
         console.print(f"[yellow]WARN[/] 无可回滚的历史记录")
@@ -430,6 +476,69 @@ def export(batch_id: str, output: str, status: Optional[str], disp_type: Optiona
         summary_path = f"{base}_summary{ext}"
         export_summary_csv(batch, summary_path)
         console.print(f"[green]OK[/] 摘要已导出到 [cyan]{summary_path}[/]")
+
+
+# ── audit-log ────────────────────────────────────────────
+@cli.command("audit-log", help="查看/导出操作审计日志")
+@click.option("--from", "from_date", default=None, help="起始日期 (YYYY-MM-DD)")
+@click.option("--to", "to_date", default=None, help="截止日期 (YYYY-MM-DD)")
+@click.option("--type", "-t", "op_type", default=None,
+              type=click.Choice(["import", "match", "mark", "rollback"]),
+              help="按操作类型过滤")
+@click.option("--batch", "-b", "batch_id", default=None, help="按批次ID过滤")
+@click.option("--output", "-o", default=None, help="导出文件路径（需配合 --format）")
+@click.option("--format", "-f", "fmt", default=None,
+              type=click.Choice(["csv", "json"]),
+              help="导出格式（csv / json）")
+def audit_log(from_date: Optional[str], to_date: Optional[str],
+              op_type: Optional[str], batch_id: Optional[str],
+              output: Optional[str], fmt: Optional[str]) -> None:
+    storage = _get_storage()
+    audit = _get_audit(storage)
+
+    if from_date:
+        from_date = from_date + "T00:00:00"
+    if to_date:
+        to_date = to_date + "T23:59:59"
+
+    records = audit.query(
+        from_date=from_date,
+        to_date=to_date,
+        op_type=op_type,
+        batch_id=batch_id,
+    )
+
+    if output and fmt:
+        if fmt == "csv":
+            count = audit.export_csv(output, records)
+        else:
+            count = audit.export_json(output, records)
+        console.print(f"[green]OK[/] 已导出 {count} 条审计记录到 [cyan]{output}[/]")
+        return
+
+    if not records:
+        console.print("[yellow]无符合条件的审计记录[/]")
+        return
+
+    table = Table(title=f"审计日志（共 {len(records)} 条）")
+    table.add_column("ID", justify="right", style="dim")
+    table.add_column("时间", style="cyan")
+    table.add_column("操作", style="magenta")
+    table.add_column("批次ID", style="bold")
+    table.add_column("影响数", justify="right")
+    table.add_column("摘要", style="dim", overflow="fold")
+
+    for r in records:
+        ts = r["timestamp"][:19].replace("T", " ")
+        table.add_row(
+            str(r["id"]),
+            ts,
+            r["command"],
+            r["batch_id"],
+            str(r["affected"]),
+            r["summary"][:80] + ("..." if len(r["summary"]) > 80 else ""),
+        )
+    console.print(table)
 
 
 def main() -> None:
