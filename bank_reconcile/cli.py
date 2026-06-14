@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import os
 import sys
-from typing import Optional
+from typing import Optional, Dict, List, Any
 
 import click
 from rich.console import Console
@@ -17,6 +17,17 @@ from .matcher import run_matching, get_tolerance_match_records
 from .storage import BatchStorage
 from .report import export_discrepancies_csv, export_summary_csv, generate_summary
 from .audit import AuditStorage
+from .scheduler import (
+    ScheduleStorage,
+    ScheduleTask,
+    ScheduleStep,
+    ScheduleStatus,
+    ScheduleRunStatus,
+    ScheduleImportConfig,
+    ScheduleReportConfig,
+    Scheduler,
+    BatchLock,
+)
 from .config import (
     load_config,
     save_config,
@@ -1579,6 +1590,381 @@ def config_show() -> None:
 
     console.print(f"\n[dim]可用标准字段: {', '.join(sorted(STANDARD_FIELDS))}[/]")
     console.print(f"[dim]可用文件类型: {', '.join(FILE_TYPE_CHOICES)}[/]")
+
+
+def _get_schedule_storage() -> ScheduleStorage:
+    storage_dir = os.environ.get("BANK_RECONCILE_HOME")
+    return ScheduleStorage(storage_dir or os.path.join(os.getcwd(), ".bank_reconcile"))
+
+
+def _parse_steps_raw(steps_raw: str) -> List[ScheduleStep]:
+    step_map = {
+        "import": ScheduleStep.IMPORT,
+        "match": ScheduleStep.MATCH,
+        "report": ScheduleStep.REPORT,
+    }
+    steps = []
+    for s in steps_raw.split(","):
+        s = s.strip().lower()
+        if not s:
+            continue
+        if s not in step_map:
+            raise ValueError(f"未知步骤: {s}，可选: import/match/report")
+        steps.append(step_map[s])
+    if not steps:
+        raise ValueError("至少需要指定一个步骤")
+    return steps
+
+
+# ── schedule group ─────────────────────────────────────────
+@cli.group("schedule", help="定时任务调度管理")
+def schedule_group() -> None:
+    pass
+
+
+@schedule_group.command("add", help="创建定时任务: schedule add --name 日常对账 --batch BATCH-XXX --cron '02:00' --steps import,match,report --config task.yaml")
+@click.option("--name", "-n", required=True, help="任务名称")
+@click.option("--batch-id", "-b", "batch_id", required=True, help="批次ID")
+@click.option("--cron", required=True, help="触发时间: 'HH:MM'（每天）或 'every N minutes'")
+@click.option("--steps", "steps_raw", required=True, help="执行步骤，逗号分隔: import,match,report（可只选几项）")
+@click.option("--config", "config_file", default=None, help="YAML 配置文件路径（包含 import_configs/report_config 等）")
+@click.option("--expires-at", default=None, help="到期时间 ISO 格式，如 2026-12-31T23:59:59")
+@click.option("--max-retries", default=3, type=int, help="失败最大重试次数")
+def schedule_add(name: str, batch_id: str, cron: str, steps_raw: str,
+                 config_file: Optional[str], expires_at: Optional[str],
+                 max_retries: int) -> None:
+    storage = _get_storage()
+    sched_storage = _get_schedule_storage()
+    audit = _get_audit(storage)
+
+    if not storage.batch_exists_anywhere(batch_id):
+        console.print(f"[red]ERR[/] 批次不存在: {batch_id}")
+        sys.exit(1)
+
+    try:
+        steps = _parse_steps_raw(steps_raw)
+    except ValueError as e:
+        console.print(f"[red]ERR[/] --steps 参数错误: {e}")
+        sys.exit(1)
+
+    import_configs: List[ScheduleImportConfig] = []
+    rule_file: Optional[str] = None
+    report_config: Optional[ScheduleReportConfig] = None
+
+    if config_file:
+        if not os.path.isfile(config_file):
+            console.print(f"[red]ERR[/] 配置文件不存在: {config_file}")
+            sys.exit(1)
+        try:
+            import yaml
+            with open(config_file, "r", encoding="utf-8") as f:
+                cfg = yaml.safe_load(f)
+            if not isinstance(cfg, dict):
+                raise ValueError("配置文件必须是对象（键值对）")
+
+            if "import_configs" in cfg and isinstance(cfg["import_configs"], list):
+                for ic in cfg["import_configs"]:
+                    if not isinstance(ic, dict) or "file_type" not in ic or "file_path" not in ic:
+                        raise ValueError("import_configs 每项必须包含 file_type 和 file_path")
+                    import_configs.append(ScheduleImportConfig(
+                        file_type=ic["file_type"],
+                        file_path=ic["file_path"],
+                        col_map=ic.get("col_map"),
+                    ))
+
+            if "rule_file" in cfg:
+                rule_file = cfg["rule_file"]
+
+            if "report_config" in cfg and isinstance(cfg["report_config"], dict):
+                rc = cfg["report_config"]
+                if "output_path" not in rc:
+                    raise ValueError("report_config 必须包含 output_path")
+                report_config = ScheduleReportConfig(
+                    output_path=rc["output_path"],
+                    with_summary=rc.get("with_summary", False),
+                )
+        except Exception as e:
+            console.print(f"[red]ERR[/] 解析配置文件失败: {e}")
+            sys.exit(1)
+
+    task = ScheduleTask.create(
+        name=name,
+        batch_id=batch_id,
+        cron=cron,
+        steps=steps,
+        import_configs=import_configs,
+        rule_file=rule_file,
+        report_config=report_config,
+        expires_at=expires_at,
+        max_retries=max_retries,
+    )
+    sched_storage.save(task)
+
+    audit.log("schedule_add", task.task_id, 0,
+              f"创建定时任务 {name}，批次 {batch_id}，cron={cron}，步骤={','.join(s.value for s in steps)}")
+    _maybe_cleanup_audit(audit, storage)
+
+    console.print(f"[green]OK[/] 定时任务已创建: [bold]{task.name}[/] (ID: [cyan]{task.task_id}[/])")
+    console.print(f"  批次: {batch_id}")
+    console.print(f"  触发: {cron}")
+    console.print(f"  步骤: {', '.join(s.value for s in steps)}")
+    if expires_at:
+        console.print(f"  到期: {expires_at}")
+    if import_configs:
+        console.print(f"  import 配置: {len(import_configs)} 个文件")
+    if report_config:
+        console.print(f"  report 输出: {report_config.output_path}")
+
+
+@schedule_group.command("list", help="列出所有定时任务")
+def schedule_list() -> None:
+    sched_storage = _get_schedule_storage()
+    tasks = sched_storage.list_tasks()
+    if not tasks:
+        console.print("[yellow]尚无定时任务[/], 使用 [cyan]bank-reconcile schedule add ...[/] 创建")
+        return
+
+    table = Table(title="定时任务列表")
+    table.add_column("任务ID", style="cyan")
+    table.add_column("名称", style="bold")
+    table.add_column("批次ID", style="green")
+    table.add_column("触发", style="yellow")
+    table.add_column("步骤", style="magenta")
+    table.add_column("状态", style="bold")
+    table.add_column("上次运行", style="dim")
+    table.add_column("重试", justify="right")
+
+    for t in tasks:
+        status = t.get("status", "active")
+        status_style = {"active": "green", "paused": "yellow", "completed": "cyan", "expired": "dim"}.get(status, "")
+        last_run = t.get("last_run_at") or "-"
+        if last_run != "-":
+            last_run = last_run[:19].replace("T", " ")
+            lr_status = t.get("last_run_status") or ""
+            if lr_status:
+                last_run += f" ({lr_status})"
+        table.add_row(
+            t["task_id"],
+            t["name"],
+            t["batch_id"],
+            t["cron"],
+            ", ".join(t.get("steps", [])),
+            f"[{status_style}]{status}[/]" if status_style else status,
+            last_run,
+            str(t.get("retry_count", 0)),
+        )
+    console.print(table)
+
+
+@schedule_group.command("show", help="查看定时任务详情")
+@click.argument("task_id")
+def schedule_show(task_id: str) -> None:
+    sched_storage = _get_schedule_storage()
+    if not sched_storage.task_exists(task_id):
+        console.print(f"[red]ERR[/] 任务不存在: {task_id}")
+        sys.exit(1)
+
+    task = sched_storage.load(task_id)
+    status_style = {"active": "green", "paused": "yellow", "completed": "cyan", "expired": "dim"}.get(task.status.value, "")
+
+    lines = [
+        f"[bold cyan]任务ID:[/] {task.task_id}",
+        f"[bold]名称:[/] {task.name}",
+        f"[bold]批次ID:[/] {task.batch_id}",
+        f"[bold]触发:[/] {task.cron}",
+        f"[bold]步骤:[/] {', '.join(s.value for s in task.steps)}",
+        f"[bold]状态:[/] [{status_style}]{task.status.value}[/]" if status_style else f"[bold]状态:[/] {task.status.value}",
+        f"[bold]创建时间:[/] {task.created_at[:19].replace('T', ' ')}",
+        f"[bold]更新时间:[/] {task.updated_at[:19].replace('T', ' ')}",
+    ]
+    if task.expires_at:
+        lines.append(f"[bold]到期时间:[/] {task.expires_at}")
+    if task.last_run_at:
+        lines.append(f"[bold]上次运行:[/] {task.last_run_at[:19].replace('T', ' ')} ({task.last_run_status.value if task.last_run_status else 'unknown'})")
+    lines.append(f"[bold]重试次数:[/] {task.retry_count}/{task.max_retries}")
+
+    if task.import_configs:
+        lines.append("")
+        lines.append("[bold]Import 配置:[/]")
+        for i, ic in enumerate(task.import_configs, 1):
+            lines.append(f"  {i}. {ic.file_type}: {ic.file_path}")
+            if ic.col_map:
+                lines.append(f"     col_map: {ic.col_map}")
+
+    if task.rule_file:
+        lines.append(f"[bold]规则文件:[/] {task.rule_file}")
+
+    if task.report_config:
+        lines.append("")
+        lines.append(f"[bold]Report 配置:[/]")
+        lines.append(f"  输出路径: {task.report_config.output_path}")
+        lines.append(f"  附带摘要: {'是' if task.report_config.with_summary else '否'}")
+
+    console.print(Panel.fit("\n".join(lines), title="任务详情"))
+
+
+@schedule_group.command("update", help="更新定时任务配置")
+@click.argument("task_id")
+@click.option("--name", default=None, help="任务名称")
+@click.option("--cron", default=None, help="触发时间")
+@click.option("--steps", "steps_raw", default=None, help="执行步骤，逗号分隔")
+@click.option("--config", "config_file", default=None, help="YAML 配置文件路径")
+@click.option("--status", default=None, type=click.Choice(["active", "paused"]), help="状态: active/paused")
+@click.option("--expires-at", default=None, help="到期时间 ISO 格式")
+def schedule_update(task_id: str, name: Optional[str], cron: Optional[str],
+                    steps_raw: Optional[str], config_file: Optional[str],
+                    status: Optional[str], expires_at: Optional[str]) -> None:
+    storage = _get_storage()
+    sched_storage = _get_schedule_storage()
+    audit = _get_audit(storage)
+
+    if not sched_storage.task_exists(task_id):
+        console.print(f"[red]ERR[/] 任务不存在: {task_id}")
+        sys.exit(1)
+
+    task = sched_storage.load(task_id)
+    changed_fields = []
+
+    if name:
+        task.name = name
+        changed_fields.append(f"name={name}")
+    if cron:
+        task.cron = cron
+        changed_fields.append(f"cron={cron}")
+    if steps_raw:
+        try:
+            steps = _parse_steps_raw(steps_raw)
+            task.steps = steps
+            changed_fields.append(f"steps={','.join(s.value for s in steps)}")
+        except ValueError as e:
+            console.print(f"[red]ERR[/] --steps 参数错误: {e}")
+            sys.exit(1)
+    if status:
+        task.status = ScheduleStatus(status)
+        changed_fields.append(f"status={status}")
+    if expires_at is not None:
+        task.expires_at = expires_at or None
+        changed_fields.append(f"expires_at={expires_at or '(removed)'}")
+
+    if config_file:
+        if not os.path.isfile(config_file):
+            console.print(f"[red]ERR[/] 配置文件不存在: {config_file}")
+            sys.exit(1)
+        try:
+            import yaml
+            with open(config_file, "r", encoding="utf-8") as f:
+                cfg = yaml.safe_load(f)
+            if not isinstance(cfg, dict):
+                raise ValueError("配置文件必须是对象")
+
+            if "import_configs" in cfg and isinstance(cfg["import_configs"], list):
+                task.import_configs = []
+                for ic in cfg["import_configs"]:
+                    if not isinstance(ic, dict) or "file_type" not in ic or "file_path" not in ic:
+                        raise ValueError("import_configs 每项必须包含 file_type 和 file_path")
+                    task.import_configs.append(ScheduleImportConfig(
+                        file_type=ic["file_type"],
+                        file_path=ic["file_path"],
+                        col_map=ic.get("col_map"),
+                    ))
+                changed_fields.append("import_configs updated")
+
+            if "rule_file" in cfg:
+                task.rule_file = cfg["rule_file"] or None
+                changed_fields.append(f"rule_file={cfg['rule_file'] or '(removed)'}")
+
+            if "report_config" in cfg:
+                rc = cfg["report_config"]
+                if rc is None:
+                    task.report_config = None
+                    changed_fields.append("report_config (removed)")
+                elif isinstance(rc, dict):
+                    if "output_path" not in rc:
+                        raise ValueError("report_config 必须包含 output_path")
+                    task.report_config = ScheduleReportConfig(
+                        output_path=rc["output_path"],
+                        with_summary=rc.get("with_summary", False),
+                    )
+                    changed_fields.append(f"report_config output={rc['output_path']}")
+        except Exception as e:
+            console.print(f"[red]ERR[/] 解析配置文件失败: {e}")
+            sys.exit(1)
+
+    if not changed_fields:
+        console.print("[yellow]未指定任何更新项[/]")
+        return
+
+    sched_storage.save(task)
+    audit.log("schedule_update", task_id, 0,
+              f"更新定时任务 {task.name}: {', '.join(changed_fields)}")
+    _maybe_cleanup_audit(audit, storage)
+
+    console.print(f"[green]OK[/] 任务已更新: [bold]{task.name}[/] ({task_id})")
+    for cf in changed_fields:
+        console.print(f"  - {cf}")
+
+
+@schedule_group.command("delete", help="删除定时任务")
+@click.argument("task_id")
+@click.option("--force", "-f", is_flag=True, help="跳过确认")
+def schedule_delete(task_id: str, force: bool) -> None:
+    storage = _get_storage()
+    sched_storage = _get_schedule_storage()
+    audit = _get_audit(storage)
+
+    if not sched_storage.task_exists(task_id):
+        console.print(f"[red]ERR[/] 任务不存在: {task_id}")
+        sys.exit(1)
+
+    task = sched_storage.load(task_id)
+    if not force:
+        console.print(f"即将删除任务: [bold]{task.name}[/] ({task_id})")
+        confirm = input("确认删除? (y/N): ").strip().lower()
+        if confirm not in ("y", "yes"):
+            console.print("[yellow]已取消[/]")
+            return
+
+    if sched_storage.delete(task_id):
+        audit.log("schedule_delete", task_id, 0, f"删除定时任务 {task.name}")
+        _maybe_cleanup_audit(audit, storage)
+        console.print(f"[green]OK[/] 任务已删除: {task.name} ({task_id})")
+    else:
+        console.print(f"[red]ERR[/] 删除失败: {task_id}")
+        sys.exit(1)
+
+
+@schedule_group.command("run", help="触发定时任务执行")
+@click.argument("task_id")
+@click.option("--now", is_flag=True, required=True, help="立即手动触发一次")
+def schedule_run(task_id: str, now: bool) -> None:
+    storage = _get_storage()
+    sched_storage = _get_schedule_storage()
+    audit = _get_audit(storage)
+
+    if not sched_storage.task_exists(task_id):
+        console.print(f"[red]ERR[/] 任务不存在: {task_id}")
+        sys.exit(1)
+
+    scheduler = Scheduler(storage.storage_dir)
+    try:
+        result = scheduler.run_task_now(task_id)
+    except FileNotFoundError as e:
+        console.print(f"[red]ERR[/] {e}")
+        sys.exit(1)
+
+    if result.get("skipped"):
+        console.print(f"[yellow]跳过[/] {result.get('reason')}: {result.get('error')}")
+        return
+
+    if result["success"]:
+        console.print(f"[green]OK[/] 任务执行成功: {task_id}")
+        for step_name, sr in result.get("steps", {}).items():
+            console.print(f"  {step_name}: {sr}")
+    else:
+        console.print(f"[red]ERR[/] 任务执行失败: {result.get('error')}")
+        for step_name, sr in result.get("steps", {}).items():
+            console.print(f"  {step_name}: {sr}")
+        sys.exit(1)
 
 
 if __name__ == "__main__":

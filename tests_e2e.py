@@ -2536,6 +2536,498 @@ def test_close_reopen_blocked_on_archived():
         shutil.rmtree(tmpdir, ignore_errors=True)
 
 
+def test_schedule_crud_and_persistence():
+    """测试调度任务 CRUD + 持久化 + 重启恢复."""
+    print("=== 测试调度任务 CRUD、持久化、重启恢复 ===")
+    import tempfile
+    import shutil
+    from datetime import datetime, timedelta
+
+    from bank_reconcile.scheduler import (
+        ScheduleStorage, ScheduleTask, ScheduleStep, ScheduleStatus,
+        ScheduleImportConfig, ScheduleReportConfig, Scheduler,
+    )
+    from bank_reconcile.storage import BatchStorage
+    from bank_reconcile.models import Batch
+
+    tmpdir = tempfile.mkdtemp(prefix="bank_sched_test_")
+    try:
+        batch_storage = BatchStorage(tmpdir)
+        batch = Batch.create("对账测试批次")
+        batch_storage.save(batch)
+        batch_id = batch.batch_id
+        print(f"  创建测试批次: {batch_id}")
+
+        sched_storage = ScheduleStorage(tmpdir)
+
+        task = ScheduleTask.create(
+            name="每日对账",
+            batch_id=batch_id,
+            cron="02:00",
+            steps=[ScheduleStep.IMPORT, ScheduleStep.MATCH, ScheduleStep.REPORT],
+            import_configs=[
+                ScheduleImportConfig(file_type="bank", file_path="/tmp/bank.csv"),
+                ScheduleImportConfig(file_type="system", file_path="/tmp/system.csv"),
+            ],
+            report_config=ScheduleReportConfig(
+                output_path="/tmp/report.csv",
+                with_summary=True,
+            ),
+            expires_at=(datetime.now() + timedelta(days=30)).isoformat(),
+            max_retries=3,
+        )
+        sched_storage.save(task)
+        task_id = task.task_id
+        print(f"  创建调度任务: {task_id}")
+
+        loaded = sched_storage.load(task_id)
+        assert loaded.task_id == task_id
+        assert loaded.name == "每日对账"
+        assert loaded.batch_id == batch_id
+        assert loaded.cron == "02:00"
+        assert [s.value for s in loaded.steps] == ["import", "match", "report"]
+        assert len(loaded.import_configs) == 2
+        assert loaded.import_configs[0].file_type == "bank"
+        assert loaded.report_config is not None
+        assert loaded.report_config.output_path == "/tmp/report.csv"
+        assert loaded.report_config.with_summary is True
+        assert loaded.max_retries == 3
+        print("  [OK] 任务保存和读取字段完整")
+
+        tasks = sched_storage.list_tasks()
+        assert len(tasks) == 1
+        assert tasks[0]["task_id"] == task_id
+        assert tasks[0]["name"] == "每日对账"
+        print("  [OK] list_tasks 返回任务摘要")
+
+        loaded.name = "每日对账v2"
+        loaded.status = ScheduleStatus.PAUSED
+        sched_storage.save(loaded)
+        reloaded = sched_storage.load(task_id)
+        assert reloaded.name == "每日对账v2"
+        assert reloaded.status == ScheduleStatus.PAUSED
+        print("  [OK] 任务更新成功")
+
+        sched2 = ScheduleStorage(tmpdir)
+        tasks_after_reload = sched2.load_all_active()
+        assert len(tasks_after_reload) == 0, "PAUSED 状态不应出现在活跃任务中"
+        reloaded.status = ScheduleStatus.ACTIVE
+        sched_storage.save(reloaded)
+
+        sched3 = ScheduleStorage(tmpdir)
+        tasks_after_reload = sched3.load_all_active()
+        assert len(tasks_after_reload) == 1
+        assert tasks_after_reload[0].task_id == task_id
+        assert tasks_after_reload[0].name == "每日对账v2"
+        print("  [OK] 模拟重启后活跃任务恢复（持久化跨重启验证）")
+
+        scheduler = Scheduler(tmpdir)
+        count = scheduler.load_active_tasks()
+        assert count == 1, f"期望加载 1 个任务，实际 {count}"
+        print("  [OK] Scheduler.load_active_tasks 成功加载任务")
+
+        expired_task = ScheduleTask.create(
+            name="已过期任务",
+            batch_id=batch_id,
+            cron="03:00",
+            steps=[ScheduleStep.MATCH],
+            expires_at=(datetime.now() - timedelta(hours=1)).isoformat(),
+        )
+        sched_storage.save(expired_task)
+        tasks_with_expired = sched_storage.load_all_active()
+        assert len(tasks_with_expired) == 1, "过期任务应被自动排除并标记 expired"
+        reloaded_expired = sched_storage.load(expired_task.task_id)
+        assert reloaded_expired.status == ScheduleStatus.EXPIRED
+        print("  [OK] 过期任务自动标记为 expired 并不再加载")
+
+        ok = sched_storage.delete(task_id)
+        assert ok is True
+        assert sched_storage.task_exists(task_id) is False
+        print("  [OK] 任务删除成功")
+
+        print("[PASS] 调度任务 CRUD/持久化/重启恢复 测试通过\n")
+
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+
+def test_schedule_batch_lock_mutex():
+    """测试批次并发锁互斥 - 两个任务不能同时操作同一批次."""
+    print("=== 测试批次并发锁互斥 ===")
+    import tempfile
+    import shutil
+    import threading
+    import time
+
+    from bank_reconcile.scheduler import BatchLock, ScheduleStorage
+    from bank_reconcile.storage import BatchStorage
+    from bank_reconcile.models import Batch
+
+    tmpdir = tempfile.mkdtemp(prefix="bank_sched_lock_")
+    try:
+        batch_storage = BatchStorage(tmpdir)
+        batch = Batch.create("锁测试批次")
+        batch_storage.save(batch)
+        batch_id = batch.batch_id
+
+        lock1 = BatchLock(tmpdir, batch_id)
+        ok = lock1.acquire(timeout=0)
+        assert ok is True, "第一个锁应该获取成功"
+        assert lock1.locked is True
+        print(f"  [OK] 锁1获取成功 (pid={os.getpid()})")
+
+        lock2 = BatchLock(tmpdir, batch_id)
+        ok2 = lock2.acquire(timeout=0)
+        assert ok2 is False, "第二个锁在同一批次应该获取失败"
+        assert lock2.locked is False
+        print("  [OK] 锁2非阻塞获取失败（互斥生效）")
+
+        ok3 = lock2.acquire(timeout=0.3)
+        assert ok3 is False, "第二个锁超时后仍应获取失败"
+        print("  [OK] 锁2带超时等待仍失败（互斥生效）")
+
+        lock1.release()
+        assert lock1.locked is False
+        print("  [OK] 锁1释放成功")
+
+        ok4 = lock2.acquire(timeout=0)
+        assert ok4 is True, "锁1释放后锁2应该获取成功"
+        assert lock2.locked is True
+        print("  [OK] 锁1释放后锁2获取成功")
+
+        lock2.release()
+
+        lock3 = BatchLock(tmpdir, batch_id)
+        with lock3:
+            assert lock3.locked is True
+            lock4 = BatchLock(tmpdir, batch_id)
+            assert lock4.acquire(timeout=0) is False
+        assert lock3.locked is False
+        print("  [OK] with 上下文管理器正常工作（自动释放锁）")
+
+        another_batch = Batch.create("另一批次")
+        batch_storage.save(another_batch)
+        lock_a = BatchLock(tmpdir, batch_id)
+        lock_b = BatchLock(tmpdir, another_batch.batch_id)
+        assert lock_a.acquire(timeout=0) is True
+        assert lock_b.acquire(timeout=0) is True
+        print("  [OK] 不同批次之间锁互不干扰")
+        lock_a.release()
+        lock_b.release()
+
+        print("[PASS] 批次并发锁互斥 测试通过\n")
+
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+
+def test_schedule_failure_retry_and_audit():
+    """测试任务失败重试计数 + 审计日志完整."""
+    print("=== 测试任务失败重试与审计日志 ===")
+    import tempfile
+    import shutil
+    import os
+    from datetime import datetime, timedelta
+
+    from bank_reconcile.scheduler import (
+        ScheduleStorage, ScheduleTask, ScheduleStep, ScheduleStatus,
+        ScheduleRunStatus, Scheduler,
+    )
+    from bank_reconcile.storage import BatchStorage
+    from bank_reconcile.models import Batch
+    from bank_reconcile.audit import AuditStorage
+
+    tmpdir = tempfile.mkdtemp(prefix="bank_sched_retry_")
+    os.environ["BANK_RECONCILE_HOME"] = tmpdir
+    try:
+        batch_storage = BatchStorage(tmpdir)
+        batch = Batch.create("重试测试批次")
+        batch_storage.save(batch)
+        batch_id = batch.batch_id
+
+        sched_storage = ScheduleStorage(tmpdir)
+        audit = AuditStorage(tmpdir)
+
+        bad_task = ScheduleTask.create(
+            name="必然失败的任务",
+            batch_id="NONEXISTENT-BATCH",
+            cron="every 1 minutes",
+            steps=[ScheduleStep.MATCH],
+            max_retries=2,
+        )
+        sched_storage.save(bad_task)
+        task_id = bad_task.task_id
+
+        scheduler = Scheduler(tmpdir)
+
+        for attempt in range(1, 4):
+            result = scheduler.run_task_now(task_id)
+            assert result["success"] is False
+            assert "批次不存在" in result["error"] or result.get("skipped") is not True
+            task_reloaded = sched_storage.load(task_id)
+            print(f"  第 {attempt} 次执行后: retry_count={task_reloaded.retry_count}, status={task_reloaded.last_run_status}")
+
+            if attempt <= 2:
+                assert task_reloaded.retry_count == attempt
+                assert task_reloaded.last_run_status == ScheduleRunStatus.FAILED
+            else:
+                assert task_reloaded.retry_count == 3
+                assert task_reloaded.last_run_status == ScheduleRunStatus.FAILED
+
+        print("  [OK] 失败重试计数正确递增，达到 max_retries 标记为 FAILED")
+
+        samples_dir = os.path.join(os.path.dirname(__file__), "samples")
+        good_batch = Batch.create("成功任务批次")
+        batch_storage.save(good_batch)
+
+        from bank_reconcile.parser import parse_csv, FileType
+        bank_result, bank_imported = parse_csv(
+            os.path.join(samples_dir, "bank_statement.csv"),
+            FileType.BANK_STATEMENT,
+        )
+        sys_result, sys_imported = parse_csv(
+            os.path.join(samples_dir, "system_receipt.csv"),
+            FileType.SYSTEM_RECEIPT,
+        )
+        good_batch.bank_txns = bank_result.transactions
+        good_batch.system_txns = sys_result.transactions
+        good_batch.imported_files = [bank_imported, sys_imported]
+        good_batch.rule_file = os.path.join(samples_dir, "rules.yaml")
+        batch_storage.save(good_batch)
+
+        report_out = os.path.join(tmpdir, "out_report.csv")
+        good_task = ScheduleTask.create(
+            name="成功任务",
+            batch_id=good_batch.batch_id,
+            cron="every 60 minutes",
+            steps=[ScheduleStep.MATCH, ScheduleStep.REPORT],
+            report_config={
+                "output_path": report_out,
+                "with_summary": True,
+            } if False else None,
+        )
+        from bank_reconcile.scheduler import ScheduleReportConfig
+        good_task.report_config = ScheduleReportConfig(output_path=report_out, with_summary=True)
+        sched_storage.save(good_task)
+        good_task_id = good_task.task_id
+
+        result = scheduler.run_task_now(good_task_id)
+        print(f"  成功任务执行结果: success={result['success']}, steps={list(result.get('steps', {}).keys())}")
+        assert result["success"] is True
+        assert "match" in result["steps"]
+        assert "report" in result["steps"]
+        assert os.path.isfile(report_out), "报告 CSV 应该已生成"
+        assert os.path.isfile(os.path.splitext(report_out)[0] + "_summary.csv"), "摘要 CSV 应该已生成"
+        task_good = sched_storage.load(good_task_id)
+        assert task_good.last_run_status == ScheduleRunStatus.SUCCESS
+        assert task_good.retry_count == 0, "成功任务 retry_count 应重置为 0"
+        print("  [OK] 成功任务正确执行，状态 SUCCESS，重试计数归零")
+
+        audit_records = audit.query(op_type="schedule_run")
+        print(f"  审计日志 schedule_run 记录数: {len(audit_records)}")
+        assert len(audit_records) >= 4, f"应至少有 4 条 schedule_run 记录（3 次失败 + 1 次成功），实际 {len(audit_records)}"
+        for rec in audit_records:
+            assert rec["command"] == "schedule_run"
+            assert rec["batch_id"]  # task_id 或 system
+            assert "timestamp" in rec and rec["timestamp"]
+        print("  [OK] schedule_run 审计日志完整")
+
+        load_count = scheduler.load_active_tasks()
+        print(f"  显式调用 load_active_tasks，加载了 {load_count} 个任务")
+        audit_load = audit.query(op_type="schedule_load")
+        print(f"  schedule_load 记录: {len(audit_load)}")
+        assert len(audit_load) >= 1, "调用 load_active_tasks 应有 schedule_load 审计记录"
+        skip_records = audit.query(op_type="schedule_run")
+        has_lock_skip = any("锁定" in r["summary"] or "batch_locked" in r.get("reason", "") for r in skip_records)
+        print(f"  [OK] schedule_load 审计日志存在，共 {len(audit_load)} 条")
+
+        print("[PASS] 失败重试与审计日志 测试通过\n")
+
+    finally:
+        if "BANK_RECONCILE_HOME" in os.environ:
+            del os.environ["BANK_RECONCILE_HOME"]
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+
+def test_schedule_cli_commands():
+    """测试 schedule CLI 子命令 add/list/show/update/delete/run --now."""
+    print("=== 测试 schedule CLI 子命令 ===")
+    import tempfile
+    import shutil
+    import os
+    from datetime import datetime, timedelta
+
+    tmpdir = tempfile.mkdtemp(prefix="bank_sched_cli_")
+    os.environ["BANK_RECONCILE_HOME"] = tmpdir
+    try:
+        from click.testing import CliRunner
+        from bank_reconcile.cli import cli
+        runner = CliRunner()
+
+        def check(desc, result, expected_exit=0):
+            assert result.exit_code == expected_exit, \
+                f"[{desc}] 退出码 {result.exit_code}, 期望 {expected_exit}, stdout={result.output}"
+            print(f"  [OK] {desc}: exit={expected_exit}")
+
+        r = runner.invoke(cli, ["create", "CLI调度测试批次"])
+        check("创建批次", r)
+        batch_line = [ln for ln in r.output.splitlines() if "BATCH-" in ln][0]
+        batch_id = batch_line.split("(ID: ")[1].rstrip(")").strip()
+        print(f"  测试批次: {batch_id}")
+
+        r = runner.invoke(cli, ["schedule", "list"])
+        check("schedule list (空)", r)
+        assert "尚无定时任务" in r.output
+
+        r = runner.invoke(cli, ["schedule", "add",
+                                "--name", "CLI测试任务",
+                                "-b", batch_id,
+                                "--cron", "03:00",
+                                "--steps", "match,report",
+                                "--max-retries", "2"])
+        check("schedule add", r)
+        assert "定时任务已创建" in r.output
+        task_line = [ln for ln in r.output.splitlines() if "SCHED-" in ln][0]
+        task_id = task_line.split("(ID: ")[1].rstrip(")").strip()
+        print(f"  创建任务: {task_id}")
+
+        r = runner.invoke(cli, ["schedule", "list"])
+        check("schedule list (有任务)", r)
+        assert task_id in r.output
+        assert "CLI测试任务" in r.output
+
+        r = runner.invoke(cli, ["schedule", "show", task_id])
+        check("schedule show", r)
+        assert task_id in r.output
+        assert "CLI测试任务" in r.output
+        assert batch_id in r.output
+        assert "03:00" in r.output
+
+        r = runner.invoke(cli, ["schedule", "update", task_id,
+                                "--name", "CLI测试任务v2",
+                                "--status", "paused"])
+        check("schedule update", r)
+        assert "任务已更新" in r.output
+        assert "name=CLI测试任务v2" in r.output
+        assert "status=paused" in r.output
+
+        r = runner.invoke(cli, ["schedule", "show", task_id])
+        assert "CLI测试任务v2" in r.output
+        assert "paused" in r.output
+        print("  [OK] schedule update 后 show 显示新值")
+
+        r = runner.invoke(cli, ["schedule", "show", "SCHED-NOTEXIST"])
+        check("schedule show 不存在", r, expected_exit=1)
+        assert "任务不存在" in r.output
+
+        r = runner.invoke(cli, ["schedule", "delete", task_id, "--force"])
+        check("schedule delete --force", r)
+        assert "任务已删除" in r.output
+
+        r = runner.invoke(cli, ["schedule", "list"])
+        assert "尚无定时任务" in r.output
+        print("  [OK] schedule delete 删除后 list 为空")
+
+        samples_dir = os.path.join(os.path.dirname(__file__), "samples")
+        r = runner.invoke(cli, ["create", "运行测试批次"])
+        batch_line = [ln for ln in r.output.splitlines() if "BATCH-" in ln][0]
+        run_batch_id = batch_line.split("(ID: ")[1].rstrip(")").strip()
+        r = runner.invoke(cli, ["import", "-b", run_batch_id, "-t", "bank",
+                                os.path.join(samples_dir, "bank_statement.csv")])
+        r = runner.invoke(cli, ["import", "-b", run_batch_id, "-t", "system",
+                                os.path.join(samples_dir, "system_receipt.csv")])
+        r = runner.invoke(cli, ["rules", "set", "-b", run_batch_id,
+                                os.path.join(samples_dir, "rules.yaml")])
+
+        report_path = os.path.join(tmpdir, "cli_run_report.csv")
+        import yaml
+        cfg_path = os.path.join(tmpdir, "task_cfg.yaml")
+        with open(cfg_path, "w", encoding="utf-8") as f:
+            yaml.dump({
+                "report_config": {
+                    "output_path": report_path,
+                    "with_summary": True,
+                }
+            }, f)
+
+        r = runner.invoke(cli, ["schedule", "add",
+                                "--name", "run-now测试",
+                                "-b", run_batch_id,
+                                "--cron", "every 120 minutes",
+                                "--steps", "match,report",
+                                "--config", cfg_path])
+        check("schedule add (with config)", r)
+        task_line = [ln for ln in r.output.splitlines() if "SCHED-" in ln][0]
+        run_task_id = task_line.split("(ID: ")[1].rstrip(")").strip()
+
+        r = runner.invoke(cli, ["schedule", "run", run_task_id, "--now"])
+        check("schedule run --now", r)
+        assert "任务执行成功" in r.output or r.exit_code == 0
+        print(f"  schedule run --now 输出: {[l for l in r.output.splitlines() if l.strip()][:5]}")
+        assert os.path.isfile(report_path), "schedule run --now 应该生成报告文件"
+        print("  [OK] schedule run --now 成功执行 match+report，报告已生成")
+
+        print("[PASS] schedule CLI 子命令 测试通过\n")
+
+    finally:
+        if "BANK_RECONCILE_HOME" in os.environ:
+            del os.environ["BANK_RECONCILE_HOME"]
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+
+def test_scheduler_should_run_logic():
+    """测试 should_run_now 的 HH:MM 和 every N minutes 触发逻辑."""
+    print("=== 测试 should_run_now 触发逻辑 ===")
+    from datetime import datetime, timedelta
+    from bank_reconcile.scheduler import ScheduleTask, ScheduleStep, ScheduleStatus
+
+    task = ScheduleTask.create(
+        name="cron测试",
+        batch_id="BATCH-TEST",
+        cron="14:30",
+        steps=[ScheduleStep.MATCH],
+    )
+
+    t1 = datetime(2026, 6, 14, 14, 30, 0)
+    assert task.should_run_now(t1) is True, "首次在指定时间点应触发"
+    task.last_run_at = t1.isoformat()
+
+    t2 = datetime(2026, 6, 14, 14, 30, 30)
+    assert task.should_run_now(t2) is False, "同一天已运行过不再触发"
+
+    t3 = datetime(2026, 6, 15, 14, 30, 0)
+    assert task.should_run_now(t3) is True, "第二天同一时间应触发"
+
+    t4 = datetime(2026, 6, 14, 14, 29, 59)
+    task.last_run_at = None
+    assert task.should_run_now(t4) is False, "时间未到不应触发"
+    print("  [OK] HH:MM 格式触发逻辑正确")
+
+    task2 = ScheduleTask.create(
+        name="every测试",
+        batch_id="BATCH-TEST",
+        cron="every 5 minutes",
+        steps=[ScheduleStep.MATCH],
+    )
+    assert task2.should_run_now() is True, "首次 every 任务应立即触发"
+    base = datetime(2026, 6, 14, 10, 0, 0)
+    task2.last_run_at = base.isoformat()
+    assert task2.should_run_now(base) is False
+    assert task2.should_run_now(base + timedelta(minutes=4)) is False
+    assert task2.should_run_now(base + timedelta(minutes=5)) is True
+    assert task2.should_run_now(base + timedelta(minutes=10)) is True
+    print("  [OK] every N minutes 格式触发逻辑正确")
+
+    task2.status = ScheduleStatus.PAUSED
+    assert task2.should_run_now(base + timedelta(minutes=30)) is False, "暂停状态不应触发"
+    task2.status = ScheduleStatus.ACTIVE
+    task2.expires_at = (base - timedelta(hours=1)).isoformat()
+    assert task2.should_run_now(base + timedelta(minutes=30)) is False, "过期任务不应触发"
+    print("  [OK] 暂停/过期状态下不触发")
+
+    print("[PASS] should_run_now 触发逻辑 测试通过\n")
+
+
 def main():
     try:
         test_parser()
@@ -2569,6 +3061,11 @@ def main():
         test_batch_cleanup_preview_force()
         test_import_col_map_positive_negative()
         test_close_reopen_blocked_on_archived()
+        test_schedule_crud_and_persistence()
+        test_schedule_batch_lock_mutex()
+        test_schedule_failure_retry_and_audit()
+        test_schedule_cli_commands()
+        test_scheduler_should_run_logic()
         print("=" * 50)
         print("所有测试通过！")
         print("=" * 50)
