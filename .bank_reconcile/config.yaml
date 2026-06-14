@@ -1,0 +1,7 @@
+audit_retention_days: 90
+column_aliases:
+  bank_statement:
+    交易单号: txn_id
+    发生额: amount
+  manual_adjustment: {}
+  system_receipt: {}

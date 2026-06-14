@@ -1,0 +1,11 @@
+audit_retention_days: 90
+column_aliases:
+  bank_statement:
+    交易单号: txn_id
+    交易摘要: description
+    交易时间: date
+    发生额: amount
+    往来单位: counterparty
+    结算币种: currency
+  manual_adjustment: {}
+  system_receipt: {}

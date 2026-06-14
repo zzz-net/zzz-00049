@@ -1,0 +1,13 @@
+{
+  "batch_id": "BATCH-3EA97E7F",
+  "name": "test_partial",
+  "created_at": "2026-06-14T14:10:49.387627",
+  "updated_at": "2026-06-14T14:10:49.387627",
+  "rule_file": null,
+  "imported_files": [],
+  "bank_txns": [],
+  "system_txns": [],
+  "adjustment_txns": [],
+  "discrepancies": [],
+  "exports": []
+}

@@ -17,7 +17,14 @@ from .matcher import run_matching
 from .storage import BatchStorage
 from .report import export_discrepancies_csv, export_summary_csv, generate_summary
 from .audit import AuditStorage
-from .config import load_config
+from .config import (
+    load_config,
+    save_config,
+    set_column_alias,
+    AliasConflictError,
+    STANDARD_FIELDS,
+    FILE_TYPE_ALIAS_KEYS,
+)
 
 
 console = Console(highlight=False, emoji=False, markup=True)
@@ -124,7 +131,7 @@ def import_file(batch_id: str, file_type: str, file_path: str) -> None:
     ft = type_map[file_type]
 
     try:
-        result, imported = parse_csv(file_path, ft)
+        result, imported = parse_csv(file_path, ft, storage_dir=storage.storage_dir)
     except FileNotFoundError as e:
         console.print(f"[red]ERR[/] {e}")
         sys.exit(1)
@@ -543,6 +550,94 @@ def audit_log(from_date: Optional[str], to_date: Optional[str],
 
 def main() -> None:
     cli()
+
+
+# ── config group ───────────────────────────────────────────
+@cli.group("config", help="查看/修改全局配置（列名别名等）")
+def config_group() -> None:
+    pass
+
+
+FILE_TYPE_CHOICES = ["bank", "system", "adjustment"]
+_FILE_TYPE_MAP = {
+    "bank": FileType.BANK_STATEMENT,
+    "system": FileType.SYSTEM_RECEIPT,
+    "adjustment": FileType.MANUAL_ADJUSTMENT,
+}
+_FILE_TYPE_LABEL = {
+    FileType.BANK_STATEMENT: "银行回单",
+    FileType.SYSTEM_RECEIPT: "系统流水",
+    FileType.MANUAL_ADJUSTMENT: "手工调整",
+}
+
+
+@config_group.command("set", help="设置列名别名: config set --type bank 交易单号 txn_id")
+@click.option("--type", "-t", "file_type", required=True,
+              type=click.Choice(FILE_TYPE_CHOICES),
+              help="文件类型")
+@click.argument("alias_name")
+@click.argument("standard_field")
+def config_set(file_type: str, alias_name: str, standard_field: str) -> None:
+    storage = _get_storage()
+    ft = _FILE_TYPE_MAP[file_type]
+
+    if standard_field not in STANDARD_FIELDS:
+        console.print(
+            f"[red]ERR[/] 标准字段 '{standard_field}' 无效。\n"
+            f"可用标准字段: [cyan]{', '.join(sorted(STANDARD_FIELDS))}[/]"
+        )
+        sys.exit(1)
+
+    try:
+        cfg = set_column_alias(storage.storage_dir, ft, alias_name, standard_field)
+    except AliasConflictError as e:
+        console.print(f"[red]ERR[/] 别名冲突: {e}")
+        sys.exit(1)
+
+    ft_key = FILE_TYPE_ALIAS_KEYS[ft]
+    console.print(
+        f"[green]OK[/] 已为 [bold]{_FILE_TYPE_LABEL[ft]}[/] 设置别名: "
+        f"[cyan]{alias_name}[/] → [magenta]{standard_field}[/]"
+    )
+    aliases = cfg["column_aliases"].get(ft_key, {})
+    if aliases:
+        console.print(f"  当前别名映射 ({len(aliases)} 条):")
+        for a, s in sorted(aliases.items()):
+            console.print(f"    [cyan]{a}[/] → [magenta]{s}[/]")
+
+
+@config_group.command("show", help="显示完整配置（含列名别名）")
+def config_show() -> None:
+    storage = _get_storage()
+    cfg = load_config(storage.storage_dir)
+
+    console.print(Panel.fit(
+        f"[bold]存储目录:[/] {storage.storage_dir}\n"
+        f"[bold]审计保留天数:[/] {cfg.get('audit_retention_days', 90)}",
+        title="全局配置",
+    ))
+
+    ca = cfg.get("column_aliases", {})
+    has_any = False
+    for choice in FILE_TYPE_CHOICES:
+        ft = _FILE_TYPE_MAP[choice]
+        ft_key = FILE_TYPE_ALIAS_KEYS[ft]
+        aliases = ca.get(ft_key, {})
+        if aliases:
+            has_any = True
+            table = Table(title=f"列名别名 - {_FILE_TYPE_LABEL[ft]} ({choice})")
+            table.add_column("别名列名", style="cyan")
+            table.add_column("标准字段", style="magenta")
+            for a, s in sorted(aliases.items()):
+                table.add_row(a, s)
+            console.print(table)
+
+    if not has_any:
+        console.print("[yellow]尚未配置任何列名别名。[/]")
+        console.print(f"使用示例: [cyan]bank-reconcile config set -t bank 交易单号 txn_id[/]")
+
+    console.print(f"\n[dim]可用标准字段: {', '.join(sorted(STANDARD_FIELDS))}[/]")
+    console.print(f"[dim]可用文件类型: {', '.join(FILE_TYPE_CHOICES)}[/]")
 
 
 if __name__ == "__main__":

@@ -7,6 +7,7 @@ from dataclasses import dataclass, field
 from typing import Dict, List, Tuple, Any, Optional
 
 from .models import FileType, Transaction, ImportedFile
+from .config import get_column_aliases, load_config
 
 
 DEFAULT_COLUMN_MAPS = {
@@ -83,14 +84,37 @@ def _detect_column(header: List[str], candidates: List[str]) -> Optional[str]:
     return None
 
 
-def _build_column_map(file_type: FileType, header: List[str]) -> Dict[str, str]:
-    """构建字段名到CSV列名的映射."""
+def _build_column_map(
+    file_type: FileType,
+    header: List[str],
+    user_aliases: Optional[Dict[str, str]] = None,
+) -> Dict[str, str]:
+    """构建字段名到CSV列名的映射.
+
+    优先匹配用户在 config.yaml 中定义的别名，匹配不上再 fallback 到内置默认列名.
+
+    Args:
+        file_type: 文件类型
+        header: CSV 表头列表
+        user_aliases: 用户别名映射 {别名列名: 标准字段}，例如 {"交易单号": "txn_id"}
+    """
     defaults = DEFAULT_COLUMN_MAPS[file_type]
     mapping: Dict[str, str] = {}
+
+    if user_aliases:
+        alias_to_std = user_aliases
+        for alias_col, std_field in alias_to_std.items():
+            detected = _detect_column(header, [alias_col])
+            if detected:
+                mapping[std_field] = detected
+
     for field_name, candidates in defaults.items():
+        if field_name in mapping:
+            continue
         detected = _detect_column(header, candidates)
         if detected:
             mapping[field_name] = detected
+
     return mapping
 
 
@@ -113,6 +137,7 @@ def parse_csv(
     file_path: str,
     file_type: FileType,
     encoding: str = "utf-8-sig",
+    storage_dir: Optional[str] = None,
 ) -> Tuple[ParseResult, ImportedFile]:
     """解析CSV文件.
 
@@ -120,12 +145,21 @@ def parse_csv(
         file_path: CSV 文件路径
         file_type: 文件类型
         encoding: 文件编码
+        storage_dir: 存储目录，用于读取 config.yaml 中的列名别名配置（可选）
 
     Returns:
         (解析结果, 导入文件记录)
     """
     if not os.path.isfile(file_path):
         raise FileNotFoundError(f"文件不存在: {file_path}")
+
+    user_aliases: Dict[str, str] = {}
+    if storage_dir is not None:
+        try:
+            cfg = load_config(storage_dir)
+            user_aliases = get_column_aliases(cfg, file_type)
+        except Exception:
+            user_aliases = {}
 
     result = ParseResult()
     imported_file = ImportedFile(
@@ -141,17 +175,19 @@ def parse_csv(
             raise ValueError(f"CSV 文件无表头: {file_path}")
 
         header = list(reader.fieldnames)
-        col_map = _build_column_map(file_type, header)
+        col_map = _build_column_map(file_type, header, user_aliases)
 
         if "txn_id" not in col_map:
             raise ValueError(
                 f"文件 {file_path} 缺少交易号列. "
                 f"支持的列名: {DEFAULT_COLUMN_MAPS[file_type]['txn_id']}"
+                + (f"，已配置别名: {list(user_aliases.keys())}" if user_aliases else "")
             )
         if "amount" not in col_map:
             raise ValueError(
                 f"文件 {file_path} 缺少金额列. "
                 f"支持的列名: {DEFAULT_COLUMN_MAPS[file_type]['amount']}"
+                + (f"，已配置别名: {list(user_aliases.keys())}" if user_aliases else "")
             )
 
         for idx, row in enumerate(reader, start=2):
