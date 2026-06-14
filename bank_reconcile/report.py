@@ -5,12 +5,13 @@ import csv
 import os
 from typing import List, Optional
 
-from .models import Batch, Discrepancy, DiscrepancyStatus, DiscrepancyType
+from .models import Batch, Discrepancy, DiscrepancyStatus, DiscrepancyType, MatchLevel
 
 
 DIFFERENCE_COLUMNS = [
     "discrepancy_id",
     "discrepancy_type",
+    "match_level",
     "status",
     "message",
     "reviewer",
@@ -69,6 +70,7 @@ def discrepancy_to_row(discrepancy: Discrepancy) -> dict:
     row = {
         "discrepancy_id": discrepancy.discrepancy_id,
         "discrepancy_type": discrepancy.discrepancy_type.value,
+        "match_level": discrepancy.match_level.value,
         "status": discrepancy.status.value,
         "message": discrepancy.message,
         "reviewer": discrepancy.reviewer or "",
@@ -115,26 +117,93 @@ def generate_summary(batch: Batch) -> dict:
     """生成批次统计摘要."""
     by_type = {}
     by_status = {}
+    by_match_level = {
+        MatchLevel.EXACT.value: 0,
+        MatchLevel.TOLERANCE.value: 0,
+        MatchLevel.MANUAL.value: 0,
+    }
+
     for d in batch.discrepancies:
         t = d.discrepancy_type.value
         by_type[t] = by_type.get(t, 0) + 1
         s = d.status.value
         by_status[s] = by_status.get(s, 0) + 1
+        ml = d.match_level.value
+        by_match_level[ml] = by_match_level.get(ml, 0) + 1
+
+    matched_exact = 0
+    matched_tolerance = 0
+    matched_manual = 0
+
+    matched_norm_bank = set()
+    matched_norm_system = set()
+
+    for d in batch.discrepancies:
+        if d.discrepancy_type in (DiscrepancyType.AMOUNT_MISMATCH, DiscrepancyType.NEEDS_MANUAL_REVIEW):
+            if d.bank_txn:
+                matched_norm_bank.add(d.bank_txn.txn_id)
+            if d.system_txn:
+                matched_norm_system.add(d.system_txn.txn_id)
+        if d.discrepancy_type == DiscrepancyType.DUPLICATE:
+            if d.bank_txn:
+                matched_norm_bank.add(d.bank_txn.txn_id)
+            if d.system_txn:
+                matched_norm_system.add(d.system_txn.txn_id)
+        if d.match_level == MatchLevel.TOLERANCE:
+            if d.bank_txn:
+                matched_norm_bank.add(d.bank_txn.txn_id)
+            if d.system_txn:
+                matched_norm_system.add(d.system_txn.txn_id)
+
+    exact_count = len(batch.bank_txns)
+    sys_count = len(batch.system_txns)
+
+    unmatched_bank = exact_count - len(matched_norm_bank)
+    unmatched_system = sys_count - len(matched_norm_system)
+
+    for d in batch.discrepancies:
+        if d.match_level == MatchLevel.EXACT:
+            if d.discrepancy_type in (DiscrepancyType.AMOUNT_MISMATCH, DiscrepancyType.NEEDS_MANUAL_REVIEW):
+                matched_exact += 1
+            elif d.discrepancy_type == DiscrepancyType.DUPLICATE:
+                matched_exact += 1
+        elif d.match_level == MatchLevel.TOLERANCE:
+            matched_tolerance += 1
+        elif d.match_level == MatchLevel.MANUAL:
+            matched_manual += 1
+
+    for d in batch.discrepancies:
+        if d.discrepancy_type in (DiscrepancyType.MISSING_IN_BANK, DiscrepancyType.MISSING_IN_SYSTEM):
+            if d.match_level == MatchLevel.MANUAL:
+                matched_manual += 1
+
+    total_matched = matched_exact + matched_tolerance + matched_manual
+    total_unmatched = max(unmatched_bank, unmatched_system)
 
     return {
         "batch_id": batch.batch_id,
         "batch_name": batch.name,
         "created_at": batch.created_at,
         "updated_at": batch.updated_at,
-        "bank_transactions": len(batch.bank_txns),
-        "system_transactions": len(batch.system_txns),
+        "bank_transactions": exact_count,
+        "system_transactions": sys_count,
         "adjustment_transactions": len(batch.adjustment_txns),
         "total_discrepancies": len(batch.discrepancies),
+        "exact_matches": matched_exact,
+        "tolerance_matches": matched_tolerance,
+        "manual_matches": matched_manual,
+        "unmatched_count": total_unmatched,
         "by_type": by_type,
         "by_status": by_status,
+        "by_match_level": by_match_level,
         "exports": batch.exports,
         "imported_files": [f.to_dict() for f in batch.imported_files],
     }
+
+
+SUMMARY_COLUMNS = [
+    "指标", "值",
+]
 
 
 def export_summary_csv(batch: Batch, output_path: str) -> None:
@@ -154,6 +223,10 @@ def export_summary_csv(batch: Batch, output_path: str) -> None:
         writer.writerow(["银行回单数", summary["bank_transactions"]])
         writer.writerow(["系统流水数", summary["system_transactions"]])
         writer.writerow(["手工调整数", summary["adjustment_transactions"]])
+        writer.writerow(["精确匹配数", summary["exact_matches"]])
+        writer.writerow(["容忍匹配数", summary["tolerance_matches"]])
+        writer.writerow(["手工匹配数", summary["manual_matches"]])
+        writer.writerow(["未匹配数", summary["unmatched_count"]])
         writer.writerow(["总差异数", summary["total_discrepancies"]])
         writer.writerow([])
         writer.writerow(["按差异类型统计"])
@@ -162,4 +235,8 @@ def export_summary_csv(batch: Batch, output_path: str) -> None:
         writer.writerow([])
         writer.writerow(["按状态统计"])
         for k, v in sorted(summary["by_status"].items()):
+            writer.writerow([k, v])
+        writer.writerow([])
+        writer.writerow(["按匹配等级统计"])
+        for k, v in sorted(summary["by_match_level"].items()):
             writer.writerow([k, v])

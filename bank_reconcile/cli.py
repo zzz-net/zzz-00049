@@ -10,10 +10,10 @@ from rich.console import Console
 from rich.table import Table
 from rich.panel import Panel
 
-from .models import Batch, FileType, DiscrepancyStatus, DiscrepancyType, BatchStatus, AdjustmentType, Transaction
+from .models import Batch, FileType, DiscrepancyStatus, DiscrepancyType, BatchStatus, AdjustmentType, Transaction, MatchLevel
 from .parser import parse_csv, parse_xlsx, parse_file, ParseResult
-from .rules import load_rules, RuleValidationError
-from .matcher import run_matching
+from .rules import load_rules, RuleValidationError, validate_rules, export_rules, import_rules, MatchRules
+from .matcher import run_matching, get_tolerance_match_records
 from .storage import BatchStorage
 from .report import export_discrepancies_csv, export_summary_csv, generate_summary
 from .audit import AuditStorage
@@ -193,11 +193,16 @@ def import_file(batch_id: str, file_type: str, file_path: str) -> None:
     _maybe_cleanup_audit(audit, storage)
 
 
-# ── rules ─────────────────────────────────────────────────
-@cli.command(help="为批次设置规则文件")
+# ── rules group ───────────────────────────────────────────
+@cli.group("rules", help="规则管理: 设置/校验/导出/导入")
+def rules_group() -> None:
+    pass
+
+
+@rules_group.command("set", help="为批次设置规则文件")
 @click.option("--batch-id", "-b", required=True, help="批次ID")
 @click.argument("rule_file")
-def rules(batch_id: str, rule_file: str) -> None:
+def rules_set(batch_id: str, rule_file: str) -> None:
     storage = _get_storage()
     if not storage.batch_exists(batch_id):
         console.print(f"[red]ERR[/] 批次不存在: {batch_id}")
@@ -217,6 +222,176 @@ def rules(batch_id: str, rule_file: str) -> None:
     console.print(f"  金额容差: {rules_obj.amount_tolerance}")
     console.print(f"  日期窗口: {rules_obj.date_window_days} 天")
     console.print(f"  人工复核关键词: {', '.join(rules_obj.manual_review_keywords)}")
+    if rules_obj.tolerance.enabled:
+        console.print(f"  [cyan]容忍匹配: 已启用[/]")
+        if rules_obj.tolerance.amount_value > 0:
+            if rules_obj.tolerance.amount_is_percent:
+                console.print(f"    金额容差: {rules_obj.tolerance.amount_value * 100:.4g}%")
+            else:
+                console.print(f"    金额容差: ±{rules_obj.tolerance.amount_value:.2f}")
+        if rules_obj.tolerance.date_tolerance_days > 0:
+            console.print(f"    日期容差: ±{rules_obj.tolerance.date_tolerance_days} 天")
+        if rules_obj.tolerance.txn_id_prefixes:
+            console.print(f"    交易号前缀: {', '.join(rules_obj.tolerance.txn_id_prefixes)}")
+        if rules_obj.tolerance.description_keywords:
+            console.print(f"    备注关键字: {', '.join(rules_obj.tolerance.description_keywords)}")
+
+
+@rules_group.command("validate", help="校验规则文件格式")
+@click.argument("rule_file")
+def rules_validate(rule_file: str) -> None:
+    ok, errors = validate_rules(rule_file)
+    if ok:
+        console.print(f"[green]OK[/] 规则文件有效: {rule_file}")
+        try:
+            rules_obj = load_rules(rule_file)
+            console.print(f"  金额容差: {rules_obj.amount_tolerance}")
+            console.print(f"  日期窗口: {rules_obj.date_window_days} 天")
+            if rules_obj.tolerance.enabled:
+                console.print(f"  [cyan]容忍匹配: 已启用[/]")
+                if rules_obj.tolerance.amount_value > 0:
+                    if rules_obj.tolerance.amount_is_percent:
+                        console.print(f"    金额容差: {rules_obj.tolerance.amount_value * 100:.4g}%")
+                    else:
+                        console.print(f"    金额容差: ±{rules_obj.tolerance.amount_value:.2f}")
+                if rules_obj.tolerance.date_tolerance_days > 0:
+                    console.print(f"    日期容差: ±{rules_obj.tolerance.date_tolerance_days} 天")
+        except Exception:
+            pass
+        sys.exit(0)
+    else:
+        console.print(f"[red]ERR[/] 规则文件校验失败: {rule_file}")
+        for e in errors:
+            console.print(f"  - {e}")
+        sys.exit(1)
+
+
+@rules_group.command("export", help="导出当前(或批次)规则到 YAML")
+@click.option("--batch-id", "-b", default=None, help="批次ID (可选，导出该批次关联的规则)")
+@click.option("--default", "use_default", is_flag=True, help="导出默认规则")
+@click.argument("output_file")
+def rules_export(batch_id: Optional[str], use_default: bool, output_file: str) -> None:
+    rules_obj: MatchRules
+    if use_default:
+        rules_obj = MatchRules.default()
+    elif batch_id:
+        storage = _get_storage()
+        if not storage.batch_exists(batch_id):
+            console.print(f"[red]ERR[/] 批次不存在: {batch_id}")
+            sys.exit(1)
+        batch = storage.load(batch_id)
+        rule_path = batch.rule_file
+        if rule_path and os.path.isfile(rule_path):
+            try:
+                rules_obj = load_rules(rule_path)
+            except RuleValidationError as e:
+                console.print(f"[red]ERR[/] 批次关联规则文件错误: {e}")
+                sys.exit(1)
+        else:
+            rules_obj = MatchRules.default()
+            console.print(f"[yellow]WARN[/] 批次未关联有效规则文件，导出默认规则")
+    else:
+        rules_obj = MatchRules.default()
+
+    try:
+        export_rules(rules_obj, output_file)
+    except Exception as e:
+        console.print(f"[red]ERR[/] 导出失败: {e}")
+        sys.exit(1)
+
+    console.print(f"[green]OK[/] 规则已导出到: [cyan]{output_file}[/]")
+
+
+@rules_group.command("import", help="从 YAML 导入规则，支持冲突检查")
+@click.option("--batch-id", "-b", default=None, help="批次ID (可选，导入后关联到该批次)")
+@click.option("--force", is_flag=True, help="忽略冲突警告直接导入")
+@click.argument("rule_file")
+def rules_import(batch_id: Optional[str], force: bool, rule_file: str) -> None:
+    storage = _get_storage() if batch_id else None
+
+    existing_rules: Optional[MatchRules] = None
+    if batch_id:
+        if not storage or not storage.batch_exists(batch_id):
+            console.print(f"[red]ERR[/] 批次不存在: {batch_id}")
+            sys.exit(1)
+        batch = storage.load(batch_id)
+        if batch.rule_file and os.path.isfile(batch.rule_file):
+            try:
+                existing_rules = load_rules(batch.rule_file)
+            except RuleValidationError:
+                existing_rules = None
+
+    try:
+        new_rules, conflicts = import_rules(rule_file, existing_rules, check_conflicts=not force)
+    except RuleValidationError as e:
+        console.print(f"[red]ERR[/] 规则文件错误: {e}")
+        sys.exit(1)
+
+    if conflicts and not force:
+        console.print(f"[yellow]WARN[/] 检测到 {len(conflicts)} 处配置差异:")
+        for c in conflicts:
+            console.print(f"  - {c}")
+        console.print(f"\n使用 [cyan]--force[/] 忽略冲突并导入。")
+        sys.exit(1)
+
+    if batch_id and storage:
+        dest_path = os.path.abspath(rule_file)
+        batch = storage.load(batch_id)
+        batch.rule_file = dest_path
+        storage.save(batch)
+        console.print(f"[green]OK[/] 规则已导入并关联到批次 {batch_id}")
+    else:
+        console.print(f"[green]OK[/] 规则文件校验通过")
+        if conflicts:
+            console.print(f"[dim]  (已忽略 {len(conflicts)} 处冲突)[/]")
+
+
+# ── report group ──────────────────────────────────────────
+@cli.group("report", help="报告生成: 汇总统计等")
+def report_group() -> None:
+    pass
+
+
+@report_group.command("summary", help="输出批次汇总: 精确/容忍/手工匹配数及未匹配数")
+@click.option("--batch-id", "-b", required=True, help="批次ID")
+@click.option("--export", "export_path", default=None, help="导出 CSV 文件路径")
+def report_summary(batch_id: str, export_path: Optional[str]) -> None:
+    storage = _get_storage()
+    if not storage.batch_exists(batch_id):
+        console.print(f"[red]ERR[/] 批次不存在: {batch_id}")
+        sys.exit(1)
+
+    batch = storage.load(batch_id)
+    summary = generate_summary(batch)
+
+    table = Table(title=f"批次汇总 - {summary['batch_name']}")
+    table.add_column("指标", style="bold")
+    table.add_column("值", justify="right")
+
+    table.add_row("批次ID", summary["batch_id"])
+    table.add_row("银行回单数", str(summary["bank_transactions"]))
+    table.add_row("系统流水数", str(summary["system_transactions"]))
+    table.add_row("手工调整数", str(summary["adjustment_transactions"]))
+    table.add_row("精确匹配数", f"[green]{summary['exact_matches']}[/]")
+    table.add_row("容忍匹配数", f"[cyan]{summary['tolerance_matches']}[/]")
+    table.add_row("手工匹配数", f"[yellow]{summary['manual_matches']}[/]")
+    table.add_row("未匹配数", f"[red]{summary['unmatched_count']}[/]")
+    table.add_row("总差异数", str(summary["total_discrepancies"]))
+
+    console.print(table)
+
+    if summary["by_match_level"]:
+        ml_table = Table(title="按匹配等级统计")
+        ml_table.add_column("匹配等级", style="bold")
+        ml_table.add_column("数量", justify="right")
+        for k, v in sorted(summary["by_match_level"].items()):
+            style = {"exact": "green", "tolerance": "cyan", "manual": "yellow"}.get(k, "")
+            ml_table.add_row(f"[{style}]{k}[/]" if style else k, str(v))
+        console.print(ml_table)
+
+    if export_path:
+        export_summary_csv(batch, export_path)
+        console.print(f"[green]OK[/] 汇总已导出到 [cyan]{export_path}[/]")
 
 
 # ── match ─────────────────────────────────────────────────
@@ -256,13 +431,29 @@ def match(batch_id: str, rule_file: Optional[str]) -> None:
     storage.save(batch)
 
     by_type = {}
+    by_match_level = {}
     for d in discrepancies:
         t = d.discrepancy_type.value
         by_type[t] = by_type.get(t, 0) + 1
+        ml = d.match_level.value
+        by_match_level[ml] = by_match_level.get(ml, 0) + 1
 
     console.print(f"[green]OK[/] 匹配完成，共发现 [bold]{len(discrepancies)}[/] 条差异")
     for t, c in sorted(by_type.items()):
         console.print(f"  {t}: {c}")
+    if by_match_level:
+        console.print(f"[dim]  按匹配等级:[/]")
+        for ml, c in sorted(by_match_level.items()):
+            console.print(f"    {ml}: {c}")
+
+    tol_records = get_tolerance_match_records(batch)
+    if tol_records:
+        console.print(f"[dim]  容忍匹配明细 ({len(tol_records)} 条):[/]")
+        for rec in tol_records[:5]:
+            console.print(f"    - 银行 {rec['bank_txn_id']}({rec['bank_amount']}) <-> "
+                          f"系统 {rec['system_txn_id']}({rec['system_amount']})")
+        if len(tol_records) > 5:
+            console.print(f"    ... 还有 {len(tol_records) - 5} 条")
 
     bank_count = len(batch.bank_txns)
     sys_count = len(batch.system_txns)
@@ -270,8 +461,16 @@ def match(batch_id: str, rule_file: Optional[str]) -> None:
         f"执行对账匹配，银行回单 {bank_count} 条，系统流水 {sys_count} 条，"
         f"差异 {len(discrepancies)} 条"
     )
+    if tol_records:
+        summary_text += f"，容忍匹配 {len(tol_records)} 条"
     audit = _get_audit(storage)
     audit.log("match", batch_id, len(discrepancies), summary_text)
+    for i, rec in enumerate(tol_records):
+        audit.log(
+            "tolerance_match", batch_id, 1,
+            f"容忍匹配 #{i + 1}: 银行 {rec['bank_txn_id']}({rec['bank_amount']}) <-> "
+            f"系统 {rec['system_txn_id']}({rec['system_amount']}), {rec['message'][:100]}"
+        )
     _maybe_cleanup_audit(audit, storage)
 
 
@@ -559,7 +758,7 @@ def reopen(batch_id: str) -> None:
 @click.option("--from", "from_date", default=None, help="起始日期 (YYYY-MM-DD)")
 @click.option("--to", "to_date", default=None, help="截止日期 (YYYY-MM-DD)")
 @click.option("--type", "-t", "op_type", default=None,
-              type=click.Choice(["import", "match", "mark", "rollback", "close", "reopen", "manual_link", "undo_manual_link"]),
+              type=click.Choice(["import", "match", "mark", "rollback", "close", "reopen", "manual_link", "undo_manual_link", "tolerance_match"]),
               help="按操作类型过滤")
 @click.option("--batch", "-b", "batch_id", default=None, help="按批次ID过滤")
 @click.option("--output", "-o", default=None, help="导出文件路径（需配合 --format）")
@@ -908,6 +1107,7 @@ def manual_link(batch_id: str, bank_txn_id: str, system_txn_id: str,
         system_txn=system_txn,
         adjustment_txn=adjustment_txn,
         message=f"手工关联: 银行 {bank_txn_id} <-> 系统 {system_txn_id}, 调整类型 {adj_type}, 金额差 {amount_diff:.2f}",
+        match_level=MatchLevel.MANUAL,
     )
     new_discrepancy.mark(DiscrepancyStatus.CONFIRMED, reviewer, note)
     batch.discrepancies.append(new_discrepancy)
@@ -987,6 +1187,7 @@ def undo(batch_id: str) -> None:
             discrepancy_id=disp_data["discrepancy_id"],
             discrepancy_type=DiscrepancyType(disp_data["discrepancy_type"]),
             status=DiscrepancyStatus(disp_data["status"]),
+            match_level=MatchLevel(disp_data.get("match_level", MatchLevel.EXACT.value)),
             bank_txn=Transaction(
                 txn_id=disp_data["bank_txn"]["txn_id"],
                 amount=disp_data["bank_txn"]["amount"],

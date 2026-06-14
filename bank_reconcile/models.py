@@ -39,6 +39,13 @@ class AdjustmentType(str, Enum):
     WRITE_OFF = "write_off"
 
 
+class MatchLevel(str, Enum):
+    """匹配等级."""
+    EXACT = "exact"
+    TOLERANCE = "tolerance"
+    MANUAL = "manual"
+
+
 class BatchStatus(str, Enum):
     """批次状态."""
     OPEN = "open"
@@ -71,6 +78,7 @@ class Discrepancy:
     discrepancy_id: str
     discrepancy_type: DiscrepancyType
     status: DiscrepancyStatus = DiscrepancyStatus.OPEN
+    match_level: MatchLevel = MatchLevel.EXACT
     bank_txn: Optional[Transaction] = None
     system_txn: Optional[Transaction] = None
     adjustment_txn: Optional[Transaction] = None
@@ -89,10 +97,12 @@ class Discrepancy:
         system_txn: Optional[Transaction] = None,
         adjustment_txn: Optional[Transaction] = None,
         message: str = "",
+        match_level: MatchLevel = MatchLevel.EXACT,
     ) -> "Discrepancy":
         return cls(
             discrepancy_id=cls._gen_id(),
             discrepancy_type=discrepancy_type,
+            match_level=match_level,
             bank_txn=bank_txn,
             system_txn=system_txn,
             adjustment_txn=adjustment_txn,
@@ -133,6 +143,7 @@ class Discrepancy:
             "discrepancy_id": self.discrepancy_id,
             "discrepancy_type": self.discrepancy_type.value,
             "status": self.status.value,
+            "match_level": self.match_level.value,
             "message": self.message,
             "reviewer": self.reviewer,
             "note": self.note,
@@ -253,6 +264,7 @@ class Batch:
                 discrepancy_id=d["discrepancy_id"],
                 discrepancy_type=DiscrepancyType(d["discrepancy_type"]),
                 status=DiscrepancyStatus(d["status"]),
+                match_level=MatchLevel(d.get("match_level", MatchLevel.EXACT.value)),
                 bank_txn=txn_from_dict(d["bank_txn"]) if d.get("bank_txn") else None,
                 system_txn=txn_from_dict(d["system_txn"]) if d.get("system_txn") else None,
                 adjustment_txn=txn_from_dict(d["adjustment_txn"]) if d.get("adjustment_txn") else None,

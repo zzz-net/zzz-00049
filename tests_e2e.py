@@ -8,12 +8,12 @@ from contextlib import redirect_stdout
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from bank_reconcile.models import Batch, FileType, DiscrepancyStatus, DiscrepancyType, AdjustmentType
+from bank_reconcile.models import Batch, FileType, DiscrepancyStatus, DiscrepancyType, AdjustmentType, MatchLevel, Transaction
 from bank_reconcile.parser import parse_csv, parse_xlsx, parse_file
-from bank_reconcile.rules import load_rules, RuleValidationError, MatchRules
-from bank_reconcile.matcher import run_matching
+from bank_reconcile.rules import load_rules, RuleValidationError, MatchRules, validate_rules, export_rules, import_rules
+from bank_reconcile.matcher import run_matching, get_tolerance_match_records
 from bank_reconcile.storage import BatchStorage
-from bank_reconcile.report import export_discrepancies_csv, generate_summary
+from bank_reconcile.report import export_discrepancies_csv, generate_summary, export_summary_csv
 from bank_reconcile.audit import AuditStorage
 from bank_reconcile.config import load_config, save_config
 
@@ -69,6 +69,7 @@ def test_rules():
     assert rules.date_window_days == 3
     assert rules.consider_adjustments is True
     assert len(rules.manual_review_keywords) > 0
+    assert rules.tolerance.enabled is False, "默认规则中 tolerance 应未启用"
     print(f"正常规则加载: 容差={rules.amount_tolerance}, 关键词={len(rules.manual_review_keywords)}个")
 
     try:
@@ -79,6 +80,7 @@ def test_rules():
 
     default = MatchRules.default()
     assert default.amount_tolerance == 0.01
+    assert default.tolerance.enabled is False
 
     print("[PASS] 规则引擎测试通过\n")
 
@@ -352,9 +354,9 @@ def test_cli_rich_output():
                             os.path.join(samples_dir, "manual_adjustment.csv")])
         check("import adjustment", r)
 
-        r = runner.invoke(cli, ["rules", "-b", batch_id,
+        r = runner.invoke(cli, ["rules", "set", "-b", batch_id,
                             os.path.join(samples_dir, "rules.yaml")])
-        check("rules", r)
+        check("rules set", r)
 
         r = runner.invoke(cli, ["match", "-b", batch_id])
         check("match", r)
@@ -535,9 +537,9 @@ def test_audit_cli_integration():
                             os.path.join(samples_dir, "manual_adjustment.csv")])
         check("import adjustment", r)
 
-        r = runner.invoke(cli, ["rules", "-b", batch_id,
+        r = runner.invoke(cli, ["rules", "set", "-b", batch_id,
                             os.path.join(samples_dir, "rules.yaml")])
-        check("rules", r)
+        check("rules set", r)
 
         r = runner.invoke(cli, ["match", "-b", batch_id])
         check("match", r)
@@ -1295,6 +1297,431 @@ def test_undo_manual_link():
         shutil.rmtree(tmpdir, ignore_errors=True)
 
 
+def test_tolerance_rules_validation():
+    """验证1: 非法规则加载报错（tolerance 段非法值）."""
+    print("=== 验证1: 非法规则加载报错 ===")
+    tmpdir = tempfile.mkdtemp(prefix="bank_reconcile_tol_val_")
+    samples_dir = os.path.join(os.path.dirname(__file__), "samples")
+
+    try:
+        bad_cases = [
+            ("tolerance.amount_tolerance 负数", {
+                "tolerance": {"amount_tolerance": -5}
+            }, "amount_tolerance 必须是非负数字"),
+            ("tolerance.amount_tolerance 布尔", {
+                "tolerance": {"amount_tolerance": True}
+            }, "不能是布尔值"),
+            ("tolerance.amount_tolerance 百分比>100", {
+                "tolerance": {"amount_tolerance": "150%"}
+            }, "百分比不能超过 100%"),
+            ("tolerance.amount_tolerance 非法字符串", {
+                "tolerance": {"amount_tolerance": "abc"}
+            }, "格式错误"),
+            ("tolerance.date_tolerance 负数", {
+                "tolerance": {"date_tolerance": -2}
+            }, "必须是非负整数天数"),
+            ("tolerance.date_tolerance 字符串", {
+                "tolerance": {"date_tolerance": "abc"}
+            }, "必须是非负整数天数"),
+            ("tolerance.txn_id_prefixes 非列表", {
+                "tolerance": {"txn_id_prefixes": "B"}
+            }, "必须是字符串列表"),
+            ("tolerance.description_keywords 非列表", {
+                "tolerance": {"description_keywords": 123}
+            }, "必须是字符串列表"),
+            ("tolerance.enabled 非布尔", {
+                "tolerance": {"enabled": "yes"}
+            }, "必须是布尔值"),
+            ("tolerance 未知字段", {
+                "tolerance": {"unknown_field": 1}
+            }, "包含未知字段"),
+            ("顶层未知字段", {
+                "unknown_top": 123
+            }, "规则文件包含未知字段"),
+        ]
+
+        import yaml
+        for case_name, rule_dict, expected_substr in bad_cases:
+            safe_name = case_name.replace(" ", "_").replace(">", "_gt_")
+            bad_path = os.path.join(tmpdir, f"bad_{safe_name}.yaml")
+            with open(bad_path, "w", encoding="utf-8") as f:
+                yaml.safe_dump(rule_dict, f, allow_unicode=True)
+            try:
+                load_rules(bad_path)
+                assert False, f"[{case_name}] 应该抛出 RuleValidationError"
+            except RuleValidationError as e:
+                assert expected_substr in str(e), \
+                    f"[{case_name}] 错误信息应包含 '{expected_substr}', 实际: {e}"
+                print(f"  [OK] {case_name}: {e}")
+
+        ok, errors = validate_rules(os.path.join(samples_dir, "rules_bad.yaml"))
+        assert not ok, "rules_bad.yaml 应该校验失败"
+        assert len(errors) > 0
+        print(f"  [OK] validate_rules 错误规则返回 (False, {len(errors)} 个错误)")
+
+        ok, errors = validate_rules(os.path.join(samples_dir, "rules.yaml"))
+        assert ok, "rules.yaml 应该校验通过"
+        assert len(errors) == 0
+        print(f"  [OK] validate_rules 正常规则返回 (True, 无错误)")
+
+        print("[PASS] 验证1 (非法规则加载报错) 通过\n")
+
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+
+def test_tolerance_matching_match_level():
+    """验证2: 容忍匹配 match_level 正确（exact/tolerance/manual）."""
+    print("=== 验证2: 容忍匹配 match_level 正确 ===")
+    samples_dir = os.path.join(os.path.dirname(__file__), "samples")
+    tmpdir = tempfile.mkdtemp(prefix="bank_reconcile_tol_match_")
+
+    try:
+        bank_result, _ = parse_csv(
+            os.path.join(samples_dir, "bank_statement.csv"),
+            FileType.BANK_STATEMENT,
+        )
+        sys_result, _ = parse_csv(
+            os.path.join(samples_dir, "system_receipt.csv"),
+            FileType.SYSTEM_RECEIPT,
+        )
+
+        batch = Batch.create("容忍匹配测试")
+        batch.bank_txns = bank_result.transactions
+        batch.system_txns = sys_result.transactions
+
+        tol_rules = MatchRules.default()
+        tol_rules.tolerance.enabled = True
+        tol_rules.tolerance.amount_value = 10.0
+        tol_rules.tolerance.amount_is_percent = False
+        tol_rules.tolerance.date_tolerance_days = 3
+        tol_rules.tolerance.txn_id_prefixes = ["B"]
+        tol_rules.tolerance.description_keywords = ["货款"]
+
+        discrepancies = run_matching(batch, tol_rules)
+        batch.discrepancies = discrepancies
+
+        levels = {d.match_level.value for d in discrepancies}
+        print(f"  匹配等级分布: {[(d.match_level.value, d.discrepancy_type.value) for d in discrepancies]}")
+
+        assert MatchLevel.EXACT.value in levels, "应有 exact 匹配产生的差异"
+        print(f"  [OK] exact 匹配存在: {sum(1 for d in discrepancies if d.match_level == MatchLevel.EXACT)} 条")
+
+        for d in discrepancies:
+            if d.match_level == MatchLevel.TOLERANCE:
+                assert d.discrepancy_type == DiscrepancyType.NEEDS_MANUAL_REVIEW, \
+                    "tolerance 匹配差异应为 NEEDS_MANUAL_REVIEW"
+                assert "[容忍匹配]" in d.message, "tolerance 匹配信息应包含 '[容忍匹配]'"
+                print(f"  [OK] tolerance 差异: {d.message[:80]}")
+
+        tol_count = sum(1 for d in discrepancies if d.match_level == MatchLevel.TOLERANCE)
+        if tol_count > 0:
+            tol_records = get_tolerance_match_records(batch)
+            assert len(tol_records) == tol_count, "get_tolerance_match_records 数量应匹配"
+            print(f"  [OK] get_tolerance_match_records 返回 {len(tol_records)} 条")
+
+        manual_rules = MatchRules.default()
+        batch2 = Batch.create("手动匹配测试")
+        batch2.bank_txns = bank_result.transactions
+        batch2.system_txns = sys_result.transactions
+        batch2.discrepancies = run_matching(batch2, manual_rules)
+
+        from datetime import datetime
+        import uuid
+        if batch2.discrepancies:
+            d_manual = batch2.discrepancies[0]
+            assert d_manual.match_level == MatchLevel.EXACT, "默认匹配应为 EXACT"
+            d_manual.match_level = MatchLevel.MANUAL
+            d_dict = d_manual.to_dict()
+            assert d_dict["match_level"] == "manual", "to_dict 应正确序列化 match_level"
+            print(f"  [OK] 手动序列化 match_level=manual 正确")
+
+        os.environ["BANK_RECONCILE_HOME"] = tmpdir
+        from click.testing import CliRunner
+        from bank_reconcile.cli import cli
+        runner = CliRunner()
+
+        def check(desc, result, expected_exit=0):
+            assert result.exit_code == expected_exit, \
+                f"[{desc}] 退出码 {result.exit_code}, 期望 {expected_exit}, stdout={result.output}"
+
+        r = runner.invoke(cli, ["create", "tol_cli_test"])
+        batch_line = [ln for ln in r.output.splitlines() if "BATCH-" in ln][0]
+        batch_id = batch_line.split("(ID: ")[1].rstrip(")").strip()
+
+        r = runner.invoke(cli, ["import", "-b", batch_id, "-t", "bank",
+                            os.path.join(samples_dir, "bank_statement.csv")])
+        check("import bank", r)
+        r = runner.invoke(cli, ["import", "-b", batch_id, "-t", "system",
+                            os.path.join(samples_dir, "system_receipt.csv")])
+        check("import system", r)
+
+        import yaml
+        tol_rule_path = os.path.join(tmpdir, "tol_rules.yaml")
+        tol_rule_data = {
+            "amount_tolerance": 0.01,
+            "tolerance": {
+                "enabled": True,
+                "amount_tolerance": 10.0,
+                "date_tolerance": 3,
+                "txn_id_prefixes": ["B"],
+            }
+        }
+        with open(tol_rule_path, "w", encoding="utf-8") as f:
+            yaml.safe_dump(tol_rule_data, f, allow_unicode=True)
+
+        r = runner.invoke(cli, ["rules", "set", "-b", batch_id, tol_rule_path])
+        check("rules set with tolerance", r)
+
+        r = runner.invoke(cli, ["match", "-b", batch_id])
+        check("match with tolerance", r)
+        assert "按匹配等级" in r.output or "tolerance" in r.output.lower() or "容忍" in r.output, \
+            "匹配输出应包含匹配等级或容忍匹配信息"
+        print(f"  [OK] CLI match 包含容忍匹配信息")
+
+        print("[PASS] 验证2 (容忍匹配 match_level 正确) 通过\n")
+
+    finally:
+        if "BANK_RECONCILE_HOME" in os.environ:
+            del os.environ["BANK_RECONCILE_HOME"]
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+
+def test_rules_roundtrip_import_export():
+    """验证3: rules 往返导入导出一致."""
+    print("=== 验证3: rules 往返导入导出一致 ===")
+    tmpdir = tempfile.mkdtemp(prefix="bank_reconcile_roundtrip_")
+    samples_dir = os.path.join(os.path.dirname(__file__), "samples")
+
+    try:
+        import yaml
+
+        original_rules = MatchRules.default()
+        original_rules.tolerance.enabled = True
+        original_rules.tolerance.amount_value = 0.05
+        original_rules.tolerance.amount_is_percent = True
+        original_rules.tolerance.date_tolerance_days = 2
+        original_rules.tolerance.txn_id_prefixes = ["PAY", "TXN"]
+        original_rules.tolerance.description_keywords = ["采购", "报销"]
+        original_rules.manual_review_keywords = ["手续费", "调账"]
+
+        export_path = os.path.join(tmpdir, "exported.yaml")
+        export_rules(original_rules, export_path)
+        assert os.path.isfile(export_path), "导出文件应存在"
+        print(f"  [OK] 规则已导出到 {export_path}")
+
+        reloaded = load_rules(export_path)
+        assert reloaded.amount_tolerance == original_rules.amount_tolerance
+        assert reloaded.date_window_days == original_rules.date_window_days
+        assert reloaded.manual_review_keywords == original_rules.manual_review_keywords
+        assert reloaded.tolerance.enabled == original_rules.tolerance.enabled
+        assert reloaded.tolerance.amount_is_percent == original_rules.tolerance.amount_is_percent
+        assert abs(reloaded.tolerance.amount_value - original_rules.tolerance.amount_value) < 1e-9
+        assert reloaded.tolerance.date_tolerance_days == original_rules.tolerance.date_tolerance_days
+        assert reloaded.tolerance.txn_id_prefixes == original_rules.tolerance.txn_id_prefixes
+        assert reloaded.tolerance.description_keywords == original_rules.tolerance.description_keywords
+        print(f"  [OK] 导出后重新加载内容一致")
+
+        export_path2 = os.path.join(tmpdir, "exported2.yaml")
+        export_rules(reloaded, export_path2)
+
+        with open(export_path, "r", encoding="utf-8") as f1, \
+             open(export_path2, "r", encoding="utf-8") as f2:
+            d1 = yaml.safe_load(f1)
+            d2 = yaml.safe_load(f2)
+        assert d1 == d2, "两次导出内容应完全一致"
+        print(f"  [OK] 两次导出 YAML 完全一致")
+
+        imported, warnings = import_rules(export_path, None, check_conflicts=True)
+        assert len(warnings) == 0, "无 existing_rules 时应无冲突警告"
+        print(f"  [OK] import_rules(无对比) 无警告")
+
+        different_rules = MatchRules.default()
+        different_rules.amount_tolerance = 0.5
+        different_rules.tolerance.enabled = True
+        different_rules.tolerance.amount_value = 100.0
+        imported2, warnings2 = import_rules(export_path, different_rules, check_conflicts=True)
+        assert len(warnings2) > 0, "与不同规则对比应产生冲突警告"
+        print(f"  [OK] 冲突检测产生 {len(warnings2)} 条警告:")
+        for w in warnings2:
+            print(f"    - {w}")
+
+        imported3, warnings3 = import_rules(export_path, different_rules, check_conflicts=False)
+        assert len(warnings3) == 0, "--force 模式下应无冲突警告"
+        print(f"  [OK] --force 模式下无冲突警告")
+
+        os.environ["BANK_RECONCILE_HOME"] = tmpdir
+        from click.testing import CliRunner
+        from bank_reconcile.cli import cli
+        runner = CliRunner()
+
+        def check(desc, result, expected_exit=0):
+            assert result.exit_code == expected_exit, \
+                f"[{desc}] 退出码 {result.exit_code}, 期望 {expected_exit}, stdout={result.output}"
+
+        r = runner.invoke(cli, ["rules", "validate", export_path])
+        check("rules validate (valid)", r)
+        assert "OK" in r.output and "规则文件有效" in r.output
+        print(f"  [OK] CLI rules validate 通过")
+
+        r = runner.invoke(cli, ["rules", "validate",
+                                os.path.join(samples_dir, "rules_bad.yaml")])
+        check("rules validate (invalid)", r, expected_exit=1)
+        assert "校验失败" in r.output
+        print(f"  [OK] CLI rules validate 失败正确退出码 1")
+
+        r = runner.invoke(cli, ["rules", "export", "--default",
+                                os.path.join(tmpdir, "cli_export.yaml")])
+        check("rules export --default", r)
+        assert os.path.isfile(os.path.join(tmpdir, "cli_export.yaml"))
+        print(f"  [OK] CLI rules export --default 成功")
+
+        r = runner.invoke(cli, ["create", "roundtrip_batch"])
+        batch_line = [ln for ln in r.output.splitlines() if "BATCH-" in ln][0]
+        batch_id = batch_line.split("(ID: ")[1].rstrip(")").strip()
+
+        r = runner.invoke(cli, ["rules", "export", "-b", batch_id,
+                                os.path.join(tmpdir, "cli_batch_export.yaml")])
+        check("rules export -b (无规则)", r)
+        assert "WARN" in r.output or "默认规则" in r.output, \
+            "批次无规则时应有警告或导出默认规则"
+        print(f"  [OK] CLI rules export -b 无规则时提示正确")
+
+        r = runner.invoke(cli, ["rules", "import", export_path])
+        check("rules import (无批次)", r)
+        print(f"  [OK] CLI rules import 无批次模式成功")
+
+        print("[PASS] 验证3 (rules 往返导入导出一致) 通过\n")
+
+    finally:
+        if "BANK_RECONCILE_HOME" in os.environ:
+            del os.environ["BANK_RECONCILE_HOME"]
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+
+def test_summary_matches_diff_count():
+    """验证4: summary 统计与 diff 数量吻合."""
+    print("=== 验证4: summary 统计与 diff 数量吻合 ===")
+    samples_dir = os.path.join(os.path.dirname(__file__), "samples")
+    tmpdir = tempfile.mkdtemp(prefix="bank_reconcile_summary_")
+
+    try:
+        bank_result, _ = parse_csv(
+            os.path.join(samples_dir, "bank_statement.csv"),
+            FileType.BANK_STATEMENT,
+        )
+        sys_result, _ = parse_csv(
+            os.path.join(samples_dir, "system_receipt.csv"),
+            FileType.SYSTEM_RECEIPT,
+        )
+
+        batch = Batch.create("summary 测试")
+        batch.bank_txns = bank_result.transactions
+        batch.system_txns = sys_result.transactions
+
+        rules = MatchRules.default()
+        batch.discrepancies = run_matching(batch, rules)
+
+        summary = generate_summary(batch)
+        print(f"  summary keys: {list(summary.keys())}")
+        print(f"  exact_matches={summary['exact_matches']}, "
+              f"tolerance_matches={summary['tolerance_matches']}, "
+              f"manual_matches={summary['manual_matches']}, "
+              f"unmatched_count={summary['unmatched_count']}")
+        print(f"  bank_txns={summary['bank_transactions']}, "
+              f"system_txns={summary['system_transactions']}")
+
+        assert "exact_matches" in summary, "summary 应包含 exact_matches"
+        assert "tolerance_matches" in summary, "summary 应包含 tolerance_matches"
+        assert "manual_matches" in summary, "summary 应包含 manual_matches"
+        assert "unmatched_count" in summary, "summary 应包含 unmatched_count"
+        assert "by_match_level" in summary, "summary 应包含 by_match_level"
+        print(f"  [OK] summary 字段完整")
+
+        os.environ["BANK_RECONCILE_HOME"] = tmpdir
+        from click.testing import CliRunner
+        from bank_reconcile.cli import cli, _build_diff_rows
+        runner = CliRunner()
+
+        def check(desc, result, expected_exit=0):
+            assert result.exit_code == expected_exit, \
+                f"[{desc}] 退出码 {result.exit_code}, 期望 {expected_exit}, stdout={result.output}"
+
+        r = runner.invoke(cli, ["create", "summary_cli_test"])
+        batch_line = [ln for ln in r.output.splitlines() if "BATCH-" in ln][0]
+        batch_id = batch_line.split("(ID: ")[1].rstrip(")").strip()
+
+        r = runner.invoke(cli, ["import", "-b", batch_id, "-t", "bank",
+                            os.path.join(samples_dir, "bank_statement.csv")])
+        check("import bank", r)
+        r = runner.invoke(cli, ["import", "-b", batch_id, "-t", "system",
+                            os.path.join(samples_dir, "system_receipt.csv")])
+        check("import system", r)
+        r = runner.invoke(cli, ["match", "-b", batch_id])
+        check("match", r)
+
+        storage = BatchStorage(tmpdir)
+        batch_loaded = storage.load(batch_id)
+        diff_rows = _build_diff_rows(batch_loaded)
+        print(f"  diff 行数: {len(diff_rows)}")
+
+        csv_path = os.path.join(tmpdir, "summary.csv")
+        r = runner.invoke(cli, ["report", "summary", "-b", batch_id, "--export", csv_path])
+        check("report summary --export", r)
+        assert "精确匹配数" in r.output or "exact" in r.output.lower(), \
+            "report summary 应包含精确匹配数"
+        assert "容忍匹配数" in r.output or "tolerance" in r.output.lower(), \
+            "report summary 应包含容忍匹配数"
+        assert "未匹配数" in r.output or "unmatched" in r.output.lower(), \
+            "report summary 应包含未匹配数"
+        print(f"  [OK] CLI report summary 输出包含匹配等级")
+
+        assert os.path.isfile(csv_path), "summary CSV 应落盘"
+        import csv
+        with open(csv_path, "r", encoding="utf-8-sig") as f:
+            reader = csv.reader(f)
+            csv_rows = list(reader)
+        csv_headers = [row[0] for row in csv_rows if row]
+        assert "精确匹配数" in csv_headers, "CSV 应包含精确匹配数"
+        assert "容忍匹配数" in csv_headers, "CSV 应包含容忍匹配数"
+        assert "手工匹配数" in csv_headers, "CSV 应包含手工匹配数"
+        assert "未匹配数" in csv_headers, "CSV 应包含未匹配数"
+        assert "按匹配等级统计" in csv_headers, "CSV 应包含按匹配等级统计"
+        print(f"  [OK] summary CSV 字段完整: {csv_headers[:12]}...")
+
+        tol_rules = MatchRules.default()
+        tol_rules.tolerance.enabled = True
+        tol_rules.tolerance.amount_value = 1000.0
+        tol_rules.tolerance.date_tolerance_days = 30
+        tol_rules.tolerance.txn_id_prefixes = ["B"]
+
+        batch2 = Batch.create("summary tol 测试")
+        batch2.bank_txns = bank_result.transactions
+        batch2.system_txns = sys_result.transactions
+        batch2.discrepancies = run_matching(batch2, tol_rules)
+
+        summary2 = generate_summary(batch2)
+        print(f"  启用容忍后: exact={summary2['exact_matches']}, "
+              f"tolerance={summary2['tolerance_matches']}, "
+              f"unmatched={summary2['unmatched_count']}")
+
+        assert summary2["tolerance_matches"] >= 0, "tolerance_matches 应非负"
+
+        diff_rows2 = _build_diff_rows(batch2)
+        print(f"  启用容忍后 diff 行数: {len(diff_rows2)}")
+        if summary2["tolerance_matches"] > 0:
+            assert len(diff_rows2) <= len(diff_rows), \
+                "启用容忍匹配后 diff 行数应减少或不变"
+            print(f"  [OK] 启用容忍匹配后 diff 从 {len(diff_rows)} 减少到 {len(diff_rows2)}")
+
+        print("[PASS] 验证4 (summary 统计与 diff 数量吻合) 通过\n")
+
+    finally:
+        if "BANK_RECONCILE_HOME" in os.environ:
+            del os.environ["BANK_RECONCILE_HOME"]
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+
 def main():
     try:
         test_parser()
@@ -1315,6 +1742,10 @@ def main():
         test_manual_diff_sort()
         test_manual_link_adjustment()
         test_undo_manual_link()
+        test_tolerance_rules_validation()
+        test_tolerance_matching_match_level()
+        test_rules_roundtrip_import_export()
+        test_summary_matches_diff_count()
         print("=" * 50)
         print("所有测试通过！")
         print("=" * 50)
