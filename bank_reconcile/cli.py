@@ -819,53 +819,36 @@ def audit_log(from_date: Optional[str], to_date: Optional[str],
 # ── diff ───────────────────────────────────────────────────
 def _get_unmatched_txns(batch: Batch):
     """获取未匹配的银行和系统记录，以及金额不匹配的记录对."""
-    matched_bank_ids = set()
-    matched_system_ids = set()
-    amount_mismatch_pairs = []
+    from collections import defaultdict
 
+    def _nid(txn_id: str) -> str:
+        return txn_id.strip().lower() if txn_id else ""
+
+    bank_by_id: dict = defaultdict(list)
+    for t in batch.bank_txns:
+        bank_by_id[_nid(t.txn_id)].append(t)
+
+    system_by_id: dict = defaultdict(list)
+    for t in batch.system_txns:
+        system_by_id[_nid(t.txn_id)].append(t)
+
+    common_ids = set(bank_by_id.keys()) & set(system_by_id.keys())
+
+    amount_mismatch_pairs = []
     for d in batch.discrepancies:
         if d.discrepancy_type == DiscrepancyType.AMOUNT_MISMATCH:
             if d.bank_txn and d.system_txn:
-                matched_bank_ids.add(d.bank_txn.txn_id)
-                matched_system_ids.add(d.system_txn.txn_id)
                 amount_mismatch_pairs.append((d.bank_txn, d.system_txn))
-        elif d.discrepancy_type == DiscrepancyType.NEEDS_MANUAL_REVIEW:
-            if d.bank_txn:
-                matched_bank_ids.add(d.bank_txn.txn_id)
-            if d.system_txn:
-                matched_system_ids.add(d.system_txn.txn_id)
 
-    for d in batch.discrepancies:
-        if d.discrepancy_type == DiscrepancyType.DUPLICATE:
-            if d.bank_txn:
-                matched_bank_ids.add(d.bank_txn.txn_id)
-            if d.system_txn:
-                matched_system_ids.add(d.system_txn.txn_id)
-
-    bank_norm_ids = set()
-    system_norm_ids = set()
-    for d in batch.discrepancies:
-        if d.discrepancy_type in (DiscrepancyType.MISSING_IN_BANK, DiscrepancyType.MISSING_IN_SYSTEM):
-            continue
-        if d.bank_txn:
-            bank_norm_ids.add(d.bank_txn.txn_id)
-        if d.system_txn:
-            system_norm_ids.add(d.system_txn.txn_id)
-
-    unmatched_bank = [t for t in batch.bank_txns if t.txn_id not in matched_bank_ids and t.txn_id not in bank_norm_ids]
-    unmatched_system = [t for t in batch.system_txns if t.txn_id not in matched_system_ids and t.txn_id not in system_norm_ids]
-
+    unmatched_bank = []
     for t in batch.bank_txns:
-        for d in batch.discrepancies:
-            if d.discrepancy_type == DiscrepancyType.MISSING_IN_SYSTEM and d.bank_txn and d.bank_txn.txn_id == t.txn_id:
-                if t not in unmatched_bank:
-                    unmatched_bank.append(t)
+        if _nid(t.txn_id) not in common_ids:
+            unmatched_bank.append(t)
 
+    unmatched_system = []
     for t in batch.system_txns:
-        for d in batch.discrepancies:
-            if d.discrepancy_type == DiscrepancyType.MISSING_IN_BANK and d.system_txn and d.system_txn.txn_id == t.txn_id:
-                if t not in unmatched_system:
-                    unmatched_system.append(t)
+        if _nid(t.txn_id) not in common_ids:
+            unmatched_system.append(t)
 
     return unmatched_bank, unmatched_system, amount_mismatch_pairs
 
@@ -890,6 +873,9 @@ def _build_diff_rows(batch: Batch):
     for bank_txn, system_txn in amount_mismatch_pairs:
         amount_diff = abs(bank_txn.amount - system_txn.amount)
         date_diff = _calc_date_diff(bank_txn.date, system_txn.date)
+        reason = f"金额不符，差 {amount_diff:.2f} 元"
+        if date_diff >= 0:
+            reason += f"；日期差 {date_diff} 天"
         rows.append({
             "sort_key": amount_diff,
             "type": "amount_mismatch",
@@ -897,6 +883,7 @@ def _build_diff_rows(batch: Batch):
             "system_txn": system_txn,
             "amount_diff": amount_diff,
             "date_diff": date_diff,
+            "reason": reason,
         })
 
     for bank_txn in unmatched_bank:
@@ -908,6 +895,10 @@ def _build_diff_rows(batch: Batch):
                 min_diff = diff
                 best_match = system_txn
         date_diff = _calc_date_diff(bank_txn.date, best_match.date) if best_match else -1
+        if best_match:
+            reason = f"银行有，系统无此交易号（最接近：{best_match.txn_id}，金额差 {min_diff:.2f} 元，日期差 {date_diff} 天）"
+        else:
+            reason = "银行有，系统无任何记录"
         rows.append({
             "sort_key": min_diff,
             "type": "missing_in_system",
@@ -915,6 +906,7 @@ def _build_diff_rows(batch: Batch):
             "system_txn": best_match,
             "amount_diff": min_diff,
             "date_diff": date_diff,
+            "reason": reason,
         })
 
     for system_txn in unmatched_system:
@@ -926,6 +918,10 @@ def _build_diff_rows(batch: Batch):
                 min_diff = diff
                 best_match = bank_txn
         date_diff = _calc_date_diff(system_txn.date, best_match.date) if best_match else -1
+        if best_match:
+            reason = f"系统有，银行无此交易号（最接近：{best_match.txn_id}，金额差 {min_diff:.2f} 元，日期差 {date_diff} 天）"
+        else:
+            reason = "系统有，银行无任何记录"
         rows.append({
             "sort_key": min_diff,
             "type": "missing_in_bank",
@@ -933,6 +929,7 @@ def _build_diff_rows(batch: Batch):
             "system_txn": system_txn,
             "amount_diff": min_diff,
             "date_diff": date_diff,
+            "reason": reason,
         })
 
     rows.sort(key=lambda r: r["sort_key"])
@@ -967,7 +964,7 @@ def diff(batch_id: str, limit: int, export_path: str) -> None:
                 "序号", "类型",
                 "银行交易号", "银行金额", "银行日期", "银行对方",
                 "系统交易号", "系统金额", "系统日期", "系统对方",
-                "金额差异", "日期偏差(天)"
+                "金额差异", "日期偏差(天)", "原因"
             ])
             for i, r in enumerate(rows, 1):
                 bt = r["bank_txn"]
@@ -984,6 +981,7 @@ def diff(batch_id: str, limit: int, export_path: str) -> None:
                     st.counterparty if st else "",
                     f"{r['amount_diff']:.2f}",
                     r["date_diff"] if r["date_diff"] >= 0 else "",
+                    r.get("reason", ""),
                 ])
         console.print(f"[green]OK[/] 已导出 {len(rows)} 条记录到 [cyan]{export_path}[/]")
         return
@@ -992,13 +990,10 @@ def diff(batch_id: str, limit: int, export_path: str) -> None:
     table.add_column("#", justify="right", style="dim")
     table.add_column("类型", style="magenta")
     table.add_column("银行交易号", style="cyan")
-    table.add_column("银行金额", justify="right")
-    table.add_column("银行日期", style="dim")
     table.add_column("系统交易号", style="green")
-    table.add_column("系统金额", justify="right")
-    table.add_column("系统日期", style="dim")
     table.add_column("金额差", justify="right", style="yellow")
     table.add_column("日期差", justify="right", style="yellow")
+    table.add_column("原因", overflow="fold")
 
     for i, r in enumerate(rows[:limit], 1):
         bt = r["bank_txn"]
@@ -1012,13 +1007,10 @@ def diff(batch_id: str, limit: int, export_path: str) -> None:
             str(i),
             type_label,
             bt.txn_id if bt else "-",
-            f"{bt.amount:.2f}" if bt else "-",
-            bt.date if bt else "-",
             st.txn_id if st else "-",
-            f"{st.amount:.2f}" if st else "-",
-            st.date if st else "-",
             f"{r['amount_diff']:.2f}",
             str(r["date_diff"]) if r["date_diff"] >= 0 else "-",
+            r.get("reason", ""),
         )
     console.print(table)
 

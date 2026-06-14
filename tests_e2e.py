@@ -1869,6 +1869,112 @@ def test_summary_perfect_exact_not_unmatched():
     print("[PASS] 回归测试 (完美精确匹配不计入未匹配) 通过\n")
 
 
+def test_diff_reason_column_visible():
+    """回归: diff 表格包含原因列，且原因中可见日期差说明."""
+    print("=== 回归测试: diff 原因列包含日期差说明 ===")
+    samples_dir = os.path.join(os.path.dirname(__file__), "samples")
+    tmpdir = tempfile.mkdtemp(prefix="bank_reconcile_diff_reason_test_")
+
+    try:
+        os.environ["BANK_RECONCILE_HOME"] = tmpdir
+
+        from click.testing import CliRunner
+        from bank_reconcile.cli import cli, _build_diff_rows
+
+        runner = CliRunner()
+
+        def check(desc, result, expected_exit=0):
+            assert result.exit_code == expected_exit, \
+                f"[{desc}] 退出码 {result.exit_code}, 期望 {expected_exit}, stdout={result.output}"
+
+        r = runner.invoke(cli, ["create", "diff原因测试"])
+        check("create", r)
+        batch_line = [ln for ln in r.output.splitlines() if "BATCH-" in ln][0]
+        batch_id = batch_line.split("(ID: ")[1].rstrip(")").strip()
+
+        runner.invoke(cli, ["import", "-b", batch_id, "-t", "bank",
+                            os.path.join(samples_dir, "bank_statement.csv")])
+        runner.invoke(cli, ["import", "-b", batch_id, "-t", "system",
+                            os.path.join(samples_dir, "system_receipt.csv")])
+        runner.invoke(cli, ["match", "-b", batch_id])
+
+        r = runner.invoke(cli, ["diff", "-b", batch_id, "-n", "10"])
+        check("diff CLI", r)
+
+        assert "原因" in r.output, "diff 输出应包含'原因'列"
+        assert "日期差" in r.output, "diff 输出应包含'日期差'列名"
+        assert "金额差" in r.output, "diff 输出应包含'金额差'列名"
+        assert "未匹配记录" in r.output, "diff 输出应包含标题'未匹配记录'"
+        print("  diff 输出包含原因列、日期差列、金额差列: OK")
+
+        storage = BatchStorage(tmpdir)
+        batch = storage.load(batch_id)
+        rows = _build_diff_rows(batch)
+        for row in rows:
+            assert "reason" in row, "每一行都应有 reason 字段"
+            assert row["reason"], "reason 字段不应为空"
+            assert "日期差" in row["reason"] or "金额不符" in row["reason"] or "系统无此交易号" in row["reason"] or "银行无此交易号" in row["reason"], \
+                f"reason 应包含有意义的描述: {row['reason']}"
+        print(f"  全部 {len(rows)} 条 diff 记录均有 reason 字段: OK")
+
+        csv_path = os.path.join(tmpdir, "diff_with_reason.csv")
+        r = runner.invoke(cli, ["diff", "-b", batch_id, "--export", csv_path])
+        check("diff --export", r)
+
+        with open(csv_path, "r", encoding="utf-8-sig") as f:
+            import csv
+            reader = csv.DictReader(f)
+            headers = reader.fieldnames
+            csv_rows = list(reader)
+
+        assert "原因" in headers, "CSV 导出应包含'原因'列"
+        assert len(csv_rows) == len(rows), "CSV 行数应与 diff 记录数一致"
+        for csv_row in csv_rows:
+            assert csv_row["原因"], "CSV 中原因列不应为空"
+        print("  CSV 导出包含原因列且有内容: OK")
+
+        print("[PASS] 回归测试 (diff 原因列包含日期差说明) 通过\n")
+
+    finally:
+        if "BANK_RECONCILE_HOME" in os.environ:
+            del os.environ["BANK_RECONCILE_HOME"]
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+
+def test_readme_rules_command_matches_cli():
+    """回归: README 中的 rules set 命令与实际 CLI help 对齐."""
+    print("=== 回归测试: README 规则命令与 CLI help 对齐 ===")
+
+    from click.testing import CliRunner
+    from bank_reconcile.cli import cli
+
+    runner = CliRunner()
+
+    r = runner.invoke(cli, ["rules", "--help"])
+    assert r.exit_code == 0, f"rules --help 应退出成功: {r.output}"
+    assert "set" in r.output, "rules group 应包含 set 子命令"
+    assert "validate" in r.output, "rules group 应包含 validate 子命令"
+    print("  rules group 包含 set/validate 子命令: OK")
+
+    r = runner.invoke(cli, ["rules", "set", "--help"])
+    assert r.exit_code == 0, f"rules set --help 应退出成功: {r.output}"
+    assert "--batch-id" in r.output or "-b" in r.output, "rules set 应支持 --batch-id / -b 选项"
+    assert "RULE_FILE" in r.output or "rule_file" in r.output or "FILE" in r.output.lower(), \
+        f"rules set 应接受规则文件位置参数，实际输出: {r.output[:200]}"
+    print("  rules set 支持 --batch-id 选项和规则文件参数: OK")
+
+    readme_path = os.path.join(os.path.dirname(__file__), "README.md")
+    assert os.path.isfile(readme_path), "README.md 应存在"
+    with open(readme_path, "r", encoding="utf-8") as f:
+        readme = f.read()
+
+    assert "rules set" in readme, "README 快速开始应使用 'rules set' 而不是单独的 'rules'"
+    assert "--batch-id" in readme, "README 示例命令应包含 --batch-id 长选项"
+    print("  README 快速开始包含 rules set 和 --batch-id: OK")
+
+    print("[PASS] 回归测试 (README 规则命令与 CLI 对齐) 通过\n")
+
+
 def main():
     try:
         test_parser()
@@ -1895,6 +2001,8 @@ def main():
         test_summary_matches_diff_count()
         test_tolerance_same_txn_id_small_diff()
         test_summary_perfect_exact_not_unmatched()
+        test_diff_reason_column_visible()
+        test_readme_rules_command_matches_cli()
         print("=" * 50)
         print("所有测试通过！")
         print("=" * 50)

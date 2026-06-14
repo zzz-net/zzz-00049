@@ -76,8 +76,14 @@ bank-reconcile import --batch-id BATCH-XXXXXXXX --type adjustment samples/manual
 ### 4. 设置对账规则
 
 ```bash
-bank-reconcile rules --batch-id BATCH-XXXXXXXX samples/rules.yaml
+bank-reconcile rules set --batch-id BATCH-XXXXXXXX samples/rules.yaml
 ```
+也可以先校验规则文件再设置：
+
+```bash
+bank-reconcile rules validate samples/rules.yaml
+```
+
 
 ### 5. 执行匹配生成差异清单
 
