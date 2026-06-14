@@ -243,15 +243,27 @@ def run_matching(batch: Batch, rules: MatchRules) -> List[Discrepancy]:
 
             amounts_ok, used_adjs = _amounts_with_adj(bank_txn, system_txn, adj_index, rules)
             if not amounts_ok:
-                discrepancies.append(Discrepancy.create(
-                    discrepancy_type=DiscrepancyType.AMOUNT_MISMATCH,
-                    bank_txn=bank_txn,
-                    system_txn=system_txn,
-                    adjustment_txn=used_adjs[0] if used_adjs else None,
-                    match_level=MatchLevel.EXACT,
-                    message=f"金额不符: 银行 {bank_txn.amount} vs 系统 {system_txn.amount}, "
-                            f"差额 {round(abs(bank_txn.amount - system_txn.amount), 2)}",
-                ))
+                tol_matched, tol_reason = _try_tolerance_match(bank_txn, system_txn, rules)
+                if tol_matched:
+                    discrepancies.append(Discrepancy.create(
+                        discrepancy_type=DiscrepancyType.NEEDS_MANUAL_REVIEW,
+                        bank_txn=bank_txn,
+                        system_txn=system_txn,
+                        match_level=MatchLevel.TOLERANCE,
+                        message=f"[容忍匹配] {tol_reason}, "
+                                f"银行 {bank_txn.txn_id} 金额 {bank_txn.amount} 日期 {bank_txn.date}, "
+                                f"系统 {system_txn.txn_id} 金额 {system_txn.amount} 日期 {system_txn.date}",
+                    ))
+                else:
+                    discrepancies.append(Discrepancy.create(
+                        discrepancy_type=DiscrepancyType.AMOUNT_MISMATCH,
+                        bank_txn=bank_txn,
+                        system_txn=system_txn,
+                        adjustment_txn=used_adjs[0] if used_adjs else None,
+                        match_level=MatchLevel.EXACT,
+                        message=f"金额不符: 银行 {bank_txn.amount} vs 系统 {system_txn.amount}, "
+                                f"差额 {round(abs(bank_txn.amount - system_txn.amount), 2)}",
+                    ))
             else:
                 if rules.needs_manual_review(bank_txn.description) or rules.needs_manual_review(system_txn.description):
                     discrepancies.append(Discrepancy.create(

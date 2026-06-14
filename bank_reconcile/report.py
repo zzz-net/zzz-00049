@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import csv
 import os
-from typing import List, Optional
+from typing import List, Optional, Dict
 
 from .models import Batch, Discrepancy, DiscrepancyStatus, DiscrepancyType, MatchLevel
 
@@ -131,53 +131,115 @@ def generate_summary(batch: Batch) -> dict:
         ml = d.match_level.value
         by_match_level[ml] = by_match_level.get(ml, 0) + 1
 
+    def _norm_id(txn_id: str) -> str:
+        return txn_id.strip().lower() if txn_id else ""
+
+    bank_by_id: Dict[str, List] = {}
+    for t in batch.bank_txns:
+        nid = _norm_id(t.txn_id)
+        bank_by_id.setdefault(nid, []).append(t)
+
+    system_by_id: Dict[str, List] = {}
+    for t in batch.system_txns:
+        nid = _norm_id(t.txn_id)
+        system_by_id.setdefault(nid, []).append(t)
+
+    disp_by_bank_id: Dict[str, List] = {}
+    disp_by_system_id: Dict[str, List] = {}
+    for d in batch.discrepancies:
+        if d.bank_txn:
+            disp_by_bank_id.setdefault(_norm_id(d.bank_txn.txn_id), []).append(d)
+        if d.system_txn:
+            disp_by_system_id.setdefault(_norm_id(d.system_txn.txn_id), []).append(d)
+
     matched_exact = 0
     matched_tolerance = 0
     matched_manual = 0
 
-    matched_norm_bank = set()
-    matched_norm_system = set()
+    paired_bank_ids: set = set()
+    paired_system_ids: set = set()
+
+    for nid in bank_by_id:
+        if nid not in system_by_id:
+            continue
+        bank_list = bank_by_id[nid]
+        sys_list = system_by_id[nid]
+        pairs = min(len(bank_list), len(sys_list))
+
+        for i in range(pairs):
+            bt = bank_list[i]
+            st = sys_list[i]
+            paired_bank_ids.add(_norm_id(bt.txn_id))
+            paired_system_ids.add(_norm_id(st.txn_id))
+
+            best_level = None
+            best_disp = None
+            for d in batch.discrepancies:
+                if d.bank_txn and d.system_txn:
+                    if _norm_id(d.bank_txn.txn_id) == _norm_id(bt.txn_id) \
+                       and _norm_id(d.system_txn.txn_id) == _norm_id(st.txn_id):
+                        if d.discrepancy_type in (
+                            DiscrepancyType.AMOUNT_MISMATCH,
+                            DiscrepancyType.NEEDS_MANUAL_REVIEW,
+                        ):
+                            best_disp = d
+                            best_level = d.match_level
+                            break
+
+            if best_level == MatchLevel.TOLERANCE:
+                matched_tolerance += 1
+            elif best_level == MatchLevel.MANUAL:
+                matched_manual += 1
+            else:
+                matched_exact += 1
 
     for d in batch.discrepancies:
-        if d.discrepancy_type in (DiscrepancyType.AMOUNT_MISMATCH, DiscrepancyType.NEEDS_MANUAL_REVIEW):
-            if d.bank_txn:
-                matched_norm_bank.add(d.bank_txn.txn_id)
-            if d.system_txn:
-                matched_norm_system.add(d.system_txn.txn_id)
+        if d.discrepancy_type == DiscrepancyType.NEEDS_MANUAL_REVIEW and d.bank_txn and d.system_txn:
+            bnid = _norm_id(d.bank_txn.txn_id)
+            snid = _norm_id(d.system_txn.txn_id)
+            if bnid != snid:
+                if d.match_level == MatchLevel.TOLERANCE:
+                    matched_tolerance += 1
+                elif d.match_level == MatchLevel.MANUAL:
+                    matched_manual += 1
+                paired_bank_ids.add(bnid)
+                paired_system_ids.add(snid)
+
+    for d in batch.discrepancies:
+        if d.match_level == MatchLevel.MANUAL:
+            if d.discrepancy_type in (
+                DiscrepancyType.MISSING_IN_BANK,
+                DiscrepancyType.MISSING_IN_SYSTEM,
+            ):
+                matched_manual += 1
+                if d.bank_txn:
+                    paired_bank_ids.add(_norm_id(d.bank_txn.txn_id))
+                if d.system_txn:
+                    paired_system_ids.add(_norm_id(d.system_txn.txn_id))
+
+    for d in batch.discrepancies:
         if d.discrepancy_type == DiscrepancyType.DUPLICATE:
             if d.bank_txn:
-                matched_norm_bank.add(d.bank_txn.txn_id)
+                paired_bank_ids.add(_norm_id(d.bank_txn.txn_id))
             if d.system_txn:
-                matched_norm_system.add(d.system_txn.txn_id)
-        if d.match_level == MatchLevel.TOLERANCE:
-            if d.bank_txn:
-                matched_norm_bank.add(d.bank_txn.txn_id)
-            if d.system_txn:
-                matched_norm_system.add(d.system_txn.txn_id)
+                paired_system_ids.add(_norm_id(d.system_txn.txn_id))
 
     exact_count = len(batch.bank_txns)
     sys_count = len(batch.system_txns)
 
-    unmatched_bank = exact_count - len(matched_norm_bank)
-    unmatched_system = sys_count - len(matched_norm_system)
+    def _count_paired_ids(txns, paired_ids):
+        seen = set()
+        for t in txns:
+            if _norm_id(t.txn_id) in paired_ids:
+                seen.add(_norm_id(t.txn_id))
+        return len(seen)
 
-    for d in batch.discrepancies:
-        if d.match_level == MatchLevel.EXACT:
-            if d.discrepancy_type in (DiscrepancyType.AMOUNT_MISMATCH, DiscrepancyType.NEEDS_MANUAL_REVIEW):
-                matched_exact += 1
-            elif d.discrepancy_type == DiscrepancyType.DUPLICATE:
-                matched_exact += 1
-        elif d.match_level == MatchLevel.TOLERANCE:
-            matched_tolerance += 1
-        elif d.match_level == MatchLevel.MANUAL:
-            matched_manual += 1
+    matched_bank_unique = _count_paired_ids(batch.bank_txns, paired_bank_ids)
+    matched_system_unique = _count_paired_ids(batch.system_txns, paired_system_ids)
 
-    for d in batch.discrepancies:
-        if d.discrepancy_type in (DiscrepancyType.MISSING_IN_BANK, DiscrepancyType.MISSING_IN_SYSTEM):
-            if d.match_level == MatchLevel.MANUAL:
-                matched_manual += 1
+    unmatched_bank = exact_count - matched_bank_unique
+    unmatched_system = sys_count - matched_system_unique
 
-    total_matched = matched_exact + matched_tolerance + matched_manual
     total_unmatched = max(unmatched_bank, unmatched_system)
 
     return {

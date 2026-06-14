@@ -1722,6 +1722,153 @@ def test_summary_matches_diff_count():
         shutil.rmtree(tmpdir, ignore_errors=True)
 
 
+def test_tolerance_same_txn_id_small_diff():
+    """回归测试: 同交易号金额差3元日期差1天应走容忍匹配，而非 exact+amount_mismatch."""
+    print("=== 回归测试: 同交易号小差异判容忍匹配 ===")
+
+    from bank_reconcile.rules import MatchRules
+
+    rules = MatchRules.default()
+    rules.tolerance.enabled = True
+    rules.tolerance.amount_value = 5.0
+    rules.tolerance.date_tolerance_days = 3
+    rules.tolerance.txn_id_prefixes = []
+    rules.tolerance.description_keywords = []
+
+    batch = Batch.create("同ID小差异测试")
+
+    batch.bank_txns = [
+        Transaction(
+            txn_id="TOL001", amount=100.00, date="2024-01-15",
+            file_type=FileType.BANK_STATEMENT, source_file="test_bank.csv", source_row=1,
+            counterparty="测试商户A", description="采购款",
+        ),
+        Transaction(
+            txn_id="BIGDIFF", amount=500.00, date="2024-01-15",
+            file_type=FileType.BANK_STATEMENT, source_file="test_bank.csv", source_row=2,
+            counterparty="测试商户B", description="测试大额差异",
+        ),
+    ]
+
+    batch.system_txns = [
+        Transaction(
+            txn_id="TOL001", amount=103.00, date="2024-01-16",
+            file_type=FileType.SYSTEM_RECEIPT, source_file="test_sys.csv", source_row=1,
+            counterparty="测试商户A", description="采购款",
+        ),
+        Transaction(
+            txn_id="BIGDIFF", amount=600.00, date="2024-01-15",
+            file_type=FileType.SYSTEM_RECEIPT, source_file="test_sys.csv", source_row=2,
+            counterparty="测试商户B", description="测试大额差异",
+        ),
+    ]
+
+    batch.discrepancies = run_matching(batch, rules)
+    discrepancies = batch.discrepancies
+
+    tol001_disps = [
+        d for d in discrepancies
+        if (d.bank_txn and d.bank_txn.txn_id == "TOL001")
+        or (d.system_txn and d.system_txn.txn_id == "TOL001")
+    ]
+    print(f"  TOL001 差异: {[(d.discrepancy_type.value, d.match_level.value) for d in tol001_disps]}")
+
+    assert len(tol001_disps) >= 1, "TOL001 应至少有1条差异记录"
+    tol_disp = tol001_disps[0]
+    assert tol_disp.match_level == MatchLevel.TOLERANCE, \
+        f"TOL001 应为 TOLERANCE 等级，实际是 {tol_disp.match_level.value}"
+    assert tol_disp.discrepancy_type == DiscrepancyType.NEEDS_MANUAL_REVIEW, \
+        f"TOL001 差异类型应为 NEEDS_MANUAL_REVIEW，实际是 {tol_disp.discrepancy_type.value}"
+    print(f"  [OK] TOL001 match_level=TOLERANCE, type=needs_manual_review")
+
+    bigdiff_disps = [
+        d for d in discrepancies
+        if (d.bank_txn and d.bank_txn.txn_id == "BIGDIFF")
+        or (d.system_txn and d.system_txn.txn_id == "BIGDIFF")
+    ]
+    print(f"  BIGDIFF 差异: {[(d.discrepancy_type.value, d.match_level.value) for d in bigdiff_disps]}")
+    assert len(bigdiff_disps) >= 1, "BIGDIFF 应至少有1条差异记录"
+    assert bigdiff_disps[0].match_level == MatchLevel.EXACT, \
+        f"BIGDIFF 应为 EXACT 等级（金额差100超容差），实际是 {bigdiff_disps[0].match_level.value}"
+    assert bigdiff_disps[0].discrepancy_type == DiscrepancyType.AMOUNT_MISMATCH, \
+        f"BIGDIFF 差异类型应为 AMOUNT_MISMATCH，实际是 {bigdiff_disps[0].discrepancy_type.value}"
+    print(f"  [OK] BIGDIFF 超容差 → match_level=EXACT, type=amount_mismatch")
+
+    tolerance_records = get_tolerance_match_records(batch)
+    assert len(tolerance_records) >= 1, "get_tolerance_match_records 应至少返回1条容忍匹配"
+    tol_ids = {r["bank_txn_id"] for r in tolerance_records} | {r["system_txn_id"] for r in tolerance_records}
+    assert "TOL001" in tol_ids, "容忍匹配记录应包含 TOL001"
+    print(f"  [OK] get_tolerance_match_records 返回 {len(tolerance_records)} 条，包含 TOL001")
+
+    print("[PASS] 回归测试 (同交易号小差异判容忍) 通过\n")
+
+
+def test_summary_perfect_exact_not_unmatched():
+    """回归测试: 完美精确匹配（同ID同金额同日期无关键词）不能被统计为未匹配."""
+    print("=== 回归测试: 完美精确匹配不计入未匹配 ===")
+
+    from bank_reconcile.rules import MatchRules
+
+    rules = MatchRules.default()
+
+    batch = Batch.create("完美匹配统计测试")
+
+    batch.bank_txns = [
+        Transaction(
+            txn_id="PERFECT", amount=999.00, date="2024-02-01",
+            file_type=FileType.BANK_STATEMENT, source_file="b.csv", source_row=1,
+            counterparty="甲公司", description="正常交易",
+        ),
+        Transaction(
+            txn_id="ONLY_BANK", amount=200.00, date="2024-02-02",
+            file_type=FileType.BANK_STATEMENT, source_file="b.csv", source_row=2,
+            counterparty="乙公司", description="银行单边",
+        ),
+    ]
+
+    batch.system_txns = [
+        Transaction(
+            txn_id="PERFECT", amount=999.00, date="2024-02-01",
+            file_type=FileType.SYSTEM_RECEIPT, source_file="s.csv", source_row=1,
+            counterparty="甲公司", description="正常交易",
+        ),
+        Transaction(
+            txn_id="ONLY_SYS", amount=300.00, date="2024-02-03",
+            file_type=FileType.SYSTEM_RECEIPT, source_file="s.csv", source_row=2,
+            counterparty="丙公司", description="系统单边",
+        ),
+    ]
+
+    batch.discrepancies = run_matching(batch, rules)
+    print(f"  生成差异数: {len(batch.discrepancies)}")
+    for d in batch.discrepancies:
+        print(f"    - {d.discrepancy_type.value} / {d.match_level.value}: {d.message[:60]}")
+
+    summary = generate_summary(batch)
+    print(f"  summary: exact={summary['exact_matches']}, "
+          f"tolerance={summary['tolerance_matches']}, "
+          f"manual={summary['manual_matches']}, "
+          f"unmatched={summary['unmatched_count']}")
+    print(f"  bank_txns={summary['bank_transactions']}, "
+          f"system_txns={summary['system_transactions']}")
+
+    assert summary["exact_matches"] >= 1, \
+        f"至少应统计到1条精确匹配（PERFECT），实际 exact_matches={summary['exact_matches']}"
+    print(f"  [OK] exact_matches={summary['exact_matches']} ≥ 1")
+
+    assert summary["unmatched_count"] >= 1 and summary["unmatched_count"] <= 2, \
+        f"未匹配数应为1或2（ONLY_BANK和ONLY_SYS各算单边），实际 {summary['unmatched_count']}"
+    print(f"  [OK] unmatched_count={summary['unmatched_count']} 在合理范围")
+
+    total = summary["exact_matches"] + summary["tolerance_matches"] + summary["manual_matches"] + summary["unmatched_count"]
+    print(f"  exact+tolerance+manual+unmatched = {total}")
+    assert summary["exact_matches"] + summary["unmatched_count"] >= summary["bank_transactions"], \
+        f"精确匹配+未匹配 ≥ 银行回单数不成立: {summary['exact_matches']}+{summary['unmatched_count']} < {summary['bank_transactions']}"
+    print(f"  [OK] 精确匹配 + 未匹配 ≥ 银行回单数（{summary['exact_matches']}+{summary['unmatched_count']} ≥ {summary['bank_transactions']}）")
+
+    print("[PASS] 回归测试 (完美精确匹配不计入未匹配) 通过\n")
+
+
 def main():
     try:
         test_parser()
@@ -1746,6 +1893,8 @@ def main():
         test_tolerance_matching_match_level()
         test_rules_roundtrip_import_export()
         test_summary_matches_diff_count()
+        test_tolerance_same_txn_id_small_diff()
+        test_summary_perfect_exact_not_unmatched()
         print("=" * 50)
         print("所有测试通过！")
         print("=" * 50)
