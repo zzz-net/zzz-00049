@@ -9,6 +9,7 @@
 - 规则驱动：金额容差、日期窗口、人工复核关键词等可配置
 - 状态持久化：所有批次数据存本地 JSON，重启可 resume
 - 完整审计：差异编号、复核人、备注、回滚记录、导出历史全程保留
+- 操作审计日志：import/match/mark/rollback 自动记录到 SQLite，可查询导出
 - 报告可追溯：每条差异关联到源文件、行号和原始数据
 
 ## 项目结构
@@ -23,7 +24,9 @@ bank_reconcile/
 │   ├── rules.py       # 规则引擎
 │   ├── matcher.py     # 匹配与差异识别
 │   ├── storage.py     # 批次状态持久化
-│   └── report.py      # 报告导出
+│   ├── report.py      # 报告导出
+│   ├── audit.py       # 操作审计（SQLite）
+│   └── config.py      # 全局配置加载
 ├── samples/           # 样例数据
 │   ├── bank_statement.csv
 │   ├── system_receipt.csv
@@ -127,6 +130,28 @@ bank-reconcile export --batch-id BATCH-XXXXXXXX -o report/open_items.csv -s open
 bank-reconcile export --batch-id BATCH-XXXXXXXX -o report/full.csv --with-summary
 ```
 
+### 11. 查看操作审计日志
+
+```bash
+# 查看全部审计记录（终端表格）
+bank-reconcile audit-log
+
+# 按操作类型过滤
+bank-reconcile audit-log --type import
+
+# 按批次过滤
+bank-reconcile audit-log --batch BATCH-XXXXXXXX
+
+# 按日期范围过滤
+bank-reconcile audit-log --from 2024-01-01 --to 2024-01-31
+
+# 导出为 CSV
+bank-reconcile audit-log -o report/audit_log.csv -f csv
+
+# 导出为 JSON
+bank-reconcile audit-log -o report/audit_log.json -f json
+```
+
 ## 差异类型说明
 
 | 类型 | 说明 |
@@ -146,6 +171,14 @@ bank-reconcile export --batch-id BATCH-XXXXXXXX -o report/full.csv --with-summar
 - **旧批次保留**：所有批次独立存储，可随时 resume 查看
 
 ## 配置说明
+
+### 全局配置 (config.yaml)
+
+存储目录下的 `config.yaml` 文件，用于全局配置。当前支持：
+
+```yaml
+audit_retention_days: 90         # 审计日志保留天数，默认 90 天，超期自动清理
+```
 
 ### 规则文件 (YAML)
 
