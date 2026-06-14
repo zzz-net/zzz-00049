@@ -88,25 +88,40 @@ def _build_column_map(
     file_type: FileType,
     header: List[str],
     user_aliases: Optional[Dict[str, str]] = None,
+    extra_col_map: Optional[Dict[str, str]] = None,
 ) -> Dict[str, str]:
     """构建字段名到CSV列名的映射.
 
-    优先匹配用户在 config.yaml 中定义的别名，匹配不上再 fallback 到内置默认列名.
+    优先级:
+    1. 命令行传入的 --col-map 参数 (extra_col_map: {别名列名: 标准字段})
+    2. 用户在 config.yaml 中定义的别名
+    3. 内置默认列名匹配
 
     Args:
         file_type: 文件类型
         header: CSV 表头列表
-        user_aliases: 用户别名映射 {别名列名: 标准字段}，例如 {"交易单号": "txn_id"}
+        user_aliases: 用户别名映射 {别名列名: 标准字段}
+        extra_col_map: 额外传入的列映射 {别名列名: 标准字段}，用于 --col-map
     """
     defaults = DEFAULT_COLUMN_MAPS[file_type]
     mapping: Dict[str, str] = {}
+    all_mapped_standard = set()
 
-    if user_aliases:
-        alias_to_std = user_aliases
-        for alias_col, std_field in alias_to_std.items():
+    if extra_col_map:
+        for alias_col, std_field in extra_col_map.items():
             detected = _detect_column(header, [alias_col])
             if detected:
                 mapping[std_field] = detected
+                all_mapped_standard.add(std_field)
+
+    if user_aliases:
+        for alias_col, std_field in user_aliases.items():
+            if std_field in mapping:
+                continue
+            detected = _detect_column(header, [alias_col])
+            if detected:
+                mapping[std_field] = detected
+                all_mapped_standard.add(std_field)
 
     for field_name, candidates in defaults.items():
         if field_name in mapping:
@@ -114,6 +129,7 @@ def _build_column_map(
         detected = _detect_column(header, candidates)
         if detected:
             mapping[field_name] = detected
+            all_mapped_standard.add(field_name)
 
     return mapping
 
@@ -139,6 +155,7 @@ def _parse_rows(
     header: List[str],
     rows: Iterator[Dict[str, Any]],
     user_aliases: Optional[Dict[str, str]] = None,
+    extra_col_map: Optional[Dict[str, str]] = None,
 ) -> Tuple[ParseResult, ImportedFile]:
     """共享的行解析逻辑. CSV 和 XLSX 都走这条路径.
 
@@ -148,29 +165,58 @@ def _parse_rows(
         header: 表头列名列表
         rows: 行迭代器，每行是 dict {列名: 值}
         user_aliases: 用户别名配置
+        extra_col_map: 命令行传入的列映射
 
     Returns:
         (解析结果, 导入文件记录)
     """
+    from .config import STANDARD_FIELDS
+
     result = ParseResult()
     imported_file = ImportedFile(
         file_type=file_type,
         file_path=os.path.abspath(file_path),
     )
 
-    col_map = _build_column_map(file_type, header, user_aliases)
+    if extra_col_map:
+        for alias_col, std_field in extra_col_map.items():
+            if std_field not in STANDARD_FIELDS:
+                raise ValueError(
+                    f"列映射 '{alias_col}' -> '{std_field}' 无效。"
+                    f"可用标准字段: {sorted(STANDARD_FIELDS)}。"
+                    f"当前文件类型支持的列名: "
+                    f"txn_id={DEFAULT_COLUMN_MAPS[file_type]['txn_id']}, "
+                    f"amount={DEFAULT_COLUMN_MAPS[file_type]['amount']}, "
+                    f"date={DEFAULT_COLUMN_MAPS[file_type]['date']}, "
+                    f"counterparty={DEFAULT_COLUMN_MAPS[file_type]['counterparty']}, "
+                    f"description={DEFAULT_COLUMN_MAPS[file_type]['description']}, "
+                    f"currency={DEFAULT_COLUMN_MAPS[file_type]['currency']}"
+                )
+
+    col_map = _build_column_map(file_type, header, user_aliases, extra_col_map)
+
+    if extra_col_map:
+        for alias_col in extra_col_map:
+            if alias_col not in header:
+                all_header_cols = ", ".join(repr(h) for h in header)
+                raise ValueError(
+                    f"列映射 '{alias_col}' 在文件 {file_path} 的表头中未找到。"
+                    f"现有表头列: {all_header_cols}"
+                )
 
     if "txn_id" not in col_map:
         raise ValueError(
             f"文件 {file_path} 缺少交易号列. "
             f"支持的列名: {DEFAULT_COLUMN_MAPS[file_type]['txn_id']}"
             + (f"，已配置别名: {list(user_aliases.keys())}" if user_aliases else "")
+            + (f"，--col-map: {list(extra_col_map.keys())}" if extra_col_map else "")
         )
     if "amount" not in col_map:
         raise ValueError(
             f"文件 {file_path} 缺少金额列. "
             f"支持的列名: {DEFAULT_COLUMN_MAPS[file_type]['amount']}"
             + (f"，已配置别名: {list(user_aliases.keys())}" if user_aliases else "")
+            + (f"，--col-map: {list(extra_col_map.keys())}" if extra_col_map else "")
         )
 
     seen_ids: Dict[str, int] = {}
@@ -243,6 +289,7 @@ def parse_csv(
     file_type: FileType,
     encoding: str = "utf-8-sig",
     storage_dir: Optional[str] = None,
+    extra_col_map: Optional[Dict[str, str]] = None,
 ) -> Tuple[ParseResult, ImportedFile]:
     """解析CSV文件.
 
@@ -251,6 +298,7 @@ def parse_csv(
         file_type: 文件类型
         encoding: 文件编码
         storage_dir: 存储目录，用于读取 config.yaml 中的列名别名配置（可选）
+        extra_col_map: 额外列映射 {别名列名: 标准字段}，来自 --col-map
 
     Returns:
         (解析结果, 导入文件记录)
@@ -266,13 +314,14 @@ def parse_csv(
             raise ValueError(f"CSV 文件无表头: {file_path}")
 
         header = list(reader.fieldnames)
-        return _parse_rows(file_path, file_type, header, reader, user_aliases)
+        return _parse_rows(file_path, file_type, header, reader, user_aliases, extra_col_map)
 
 
 def parse_xlsx(
     file_path: str,
     file_type: FileType,
     storage_dir: Optional[str] = None,
+    extra_col_map: Optional[Dict[str, str]] = None,
 ) -> Tuple[ParseResult, ImportedFile]:
     """解析 XLSX 文件（读取第一个 sheet，走与 CSV 完全相同的列名匹配+行解析逻辑）.
 
@@ -280,6 +329,7 @@ def parse_xlsx(
         file_path: XLSX 文件路径
         file_type: 文件类型
         storage_dir: 存储目录，用于读取 config.yaml 中的列名别名配置（可选）
+        extra_col_map: 额外列映射 {别名列名: 标准字段}，来自 --col-map
 
     Returns:
         (解析结果, 导入文件记录)
@@ -325,7 +375,7 @@ def parse_xlsx(
                         row_dict[col_name] = ""
                 yield row_dict
 
-        return _parse_rows(file_path, file_type, header, _row_gen(), user_aliases)
+        return _parse_rows(file_path, file_type, header, _row_gen(), user_aliases, extra_col_map)
     finally:
         wb.close()
 
@@ -335,13 +385,14 @@ def parse_file(
     file_type: FileType,
     encoding: str = "utf-8-sig",
     storage_dir: Optional[str] = None,
+    extra_col_map: Optional[Dict[str, str]] = None,
 ) -> Tuple[ParseResult, ImportedFile]:
     """统一入口：根据扩展名自动选择 CSV 或 XLSX 解析器."""
     ext = os.path.splitext(file_path)[1].lower()
     if ext == ".xlsx":
-        return parse_xlsx(file_path, file_type, storage_dir=storage_dir)
+        return parse_xlsx(file_path, file_type, storage_dir=storage_dir, extra_col_map=extra_col_map)
     elif ext == ".csv":
-        return parse_csv(file_path, file_type, encoding=encoding, storage_dir=storage_dir)
+        return parse_csv(file_path, file_type, encoding=encoding, storage_dir=storage_dir, extra_col_map=extra_col_map)
     else:
         raise ValueError(
             f"不支持的文件扩展名: {ext}。仅支持 .csv 和 .xlsx"

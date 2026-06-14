@@ -1,4 +1,4 @@
-"""操作审计模块 - SQLite 持久化审计日志."""
+"""操作审计模块 - SQLite 持久化审计日志 + 归档/恢复记录表."""
 from __future__ import annotations
 
 import csv
@@ -26,6 +26,24 @@ CREATE INDEX IF NOT EXISTS idx_audit_command   ON audit_log(command);
 CREATE INDEX IF NOT EXISTS idx_audit_batch_id  ON audit_log(batch_id);
 """
 
+ARCHIVE_TABLE_DDL = """
+CREATE TABLE IF NOT EXISTS archive_log (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    timestamp   TEXT    NOT NULL,
+    operation   TEXT    NOT NULL,
+    batch_id    TEXT    NOT NULL,
+    batch_name  TEXT    NOT NULL DEFAULT '',
+    operator    TEXT    NOT NULL DEFAULT '',
+    note        TEXT    NOT NULL DEFAULT ''
+);
+"""
+
+ARCHIVE_INDEX_DDL = """
+CREATE INDEX IF NOT EXISTS idx_archive_timestamp ON archive_log(timestamp);
+CREATE INDEX IF NOT EXISTS idx_archive_operation ON archive_log(operation);
+CREATE INDEX IF NOT EXISTS idx_archive_batch_id  ON archive_log(batch_id);
+"""
+
 
 class AuditStorage:
     def __init__(self, storage_dir: str) -> None:
@@ -42,7 +60,10 @@ class AuditStorage:
     def _init_db(self) -> None:
         conn = self._connect()
         try:
-            conn.executescript(AUDIT_TABLE_DDL + AUDIT_INDEX_DDL)
+            conn.executescript(
+                AUDIT_TABLE_DDL + AUDIT_INDEX_DDL
+                + ARCHIVE_TABLE_DDL + ARCHIVE_INDEX_DDL
+            )
             conn.commit()
         finally:
             conn.close()
@@ -63,6 +84,60 @@ class AuditStorage:
             )
             conn.commit()
             return cur.lastrowid
+        finally:
+            conn.close()
+
+    def log_archive(
+        self,
+        operation: str,
+        batch_id: str,
+        batch_name: str = "",
+        operator: str = "",
+        note: str = "",
+    ) -> int:
+        """记录归档/恢复操作."""
+        conn = self._connect()
+        try:
+            cur = conn.execute(
+                "INSERT INTO archive_log (timestamp, operation, batch_id, batch_name, operator, note) "
+                "VALUES (?, ?, ?, ?, ?, ?)",
+                (datetime.now().isoformat(), operation, batch_id, batch_name, operator, note),
+            )
+            conn.commit()
+            return cur.lastrowid
+        finally:
+            conn.close()
+
+    def query_archive_log(
+        self,
+        batch_id: Optional[str] = None,
+        operation: Optional[str] = None,
+    ) -> List[Dict[str, Any]]:
+        clauses: List[str] = []
+        params: List[Any] = []
+        if batch_id:
+            clauses.append("batch_id = ?")
+            params.append(batch_id)
+        if operation:
+            clauses.append("operation = ?")
+            params.append(operation)
+        where = (" WHERE " + " AND ".join(clauses)) if clauses else ""
+        sql = f"SELECT * FROM archive_log{where} ORDER BY timestamp DESC"
+        conn = self._connect()
+        try:
+            rows = conn.execute(sql, params).fetchall()
+            return [
+                {
+                    "id": r["id"],
+                    "timestamp": r["timestamp"],
+                    "operation": r["operation"],
+                    "batch_id": r["batch_id"],
+                    "batch_name": r["batch_name"],
+                    "operator": r["operator"],
+                    "note": r["note"],
+                }
+                for r in rows
+            ]
         finally:
             conn.close()
 

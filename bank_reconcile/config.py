@@ -20,6 +20,7 @@ FILE_TYPE_ALIAS_KEYS = {
 
 DEFAULT_CONFIG: Dict[str, Any] = {
     "audit_retention_days": 90,
+    "retention_days": 365,
     "column_aliases": {
         "bank_statement": {},
         "system_receipt": {},
@@ -40,6 +41,7 @@ def config_path(storage_dir: str) -> str:
 def load_config(storage_dir: str) -> Dict[str, Any]:
     cfg = {
         "audit_retention_days": DEFAULT_CONFIG["audit_retention_days"],
+        "retention_days": DEFAULT_CONFIG["retention_days"],
         "column_aliases": {
             "bank_statement": {},
             "system_receipt": {},
@@ -53,6 +55,8 @@ def load_config(storage_dir: str) -> Dict[str, Any]:
         if isinstance(data, dict):
             if "audit_retention_days" in data:
                 cfg["audit_retention_days"] = data["audit_retention_days"]
+            if "retention_days" in data:
+                cfg["retention_days"] = data["retention_days"]
             if "column_aliases" in data and isinstance(data["column_aliases"], dict):
                 for ft_key in FILE_TYPE_ALIAS_KEYS.values():
                     if ft_key in data["column_aliases"] and isinstance(data["column_aliases"][ft_key], dict):

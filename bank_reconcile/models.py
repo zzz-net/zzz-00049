@@ -50,6 +50,7 @@ class BatchStatus(str, Enum):
     """批次状态."""
     OPEN = "open"
     CLOSED = "closed"
+    ARCHIVED = "archived"
 
 
 @dataclass
@@ -200,8 +201,12 @@ class Batch:
     def is_open(self) -> bool:
         return self.status == BatchStatus.OPEN
 
+    @property
+    def is_archived(self) -> bool:
+        return self.status == BatchStatus.ARCHIVED
+
     def close(self) -> bool:
-        """关闭批次（归档）. 返回 True 表示状态发生了变化."""
+        """关闭批次. 返回 True 表示状态发生了变化."""
         if self.status == BatchStatus.CLOSED:
             return False
         self.status = BatchStatus.CLOSED
@@ -213,6 +218,22 @@ class Batch:
         if self.status == BatchStatus.OPEN:
             return False
         self.status = BatchStatus.OPEN
+        self.touch()
+        return True
+
+    def archive(self) -> bool:
+        """归档批次. 返回 True 表示状态发生了变化."""
+        if self.status == BatchStatus.ARCHIVED:
+            return False
+        self.status = BatchStatus.ARCHIVED
+        self.touch()
+        return True
+
+    def unarchive(self) -> bool:
+        """从归档恢复（恢复为 CLOSED 状态）. 返回 True 表示状态发生了变化."""
+        if self.status != BatchStatus.ARCHIVED:
+            return False
+        self.status = BatchStatus.CLOSED
         self.touch()
         return True
 

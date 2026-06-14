@@ -2,116 +2,80 @@
   "batch_id": "BATCH-E3227FCF",
   "name": "test_alias_all",
   "created_at": "2026-06-14T14:10:37.300654",
-  "updated_at": "2026-06-14T14:11:19.537471",
+  "updated_at": "2026-06-14T18:19:20.963145",
+  "status": "open",
   "rule_file": null,
   "imported_files": [
     {
       "file_type": "bank_statement",
-      "file_path": "D:\\workSpace\\AI__SPACE\\zzz-00049\\samples_alias\\bank_alias_all.csv",
-      "imported_at": "2026-06-14T14:11:19.536490",
-      "row_count": 5,
+      "file_path": "D:\\workSpace\\AI__SPACE\\zzz-00049\\samples_alias\\bank_custom_cols.csv",
+      "imported_at": "2026-06-14T18:19:20.962956",
+      "row_count": 3,
       "error_count": 0
     }
   ],
   "bank_txns": [
     {
-      "txn_id": "A001",
-      "amount": 1500.0,
-      "date": "",
+      "txn_id": "C001",
+      "amount": 999.99,
+      "date": "2024-03-01",
       "file_type": "bank_statement",
-      "source_file": "D:\\workSpace\\AI__SPACE\\zzz-00049\\samples_alias\\bank_alias_all.csv",
+      "source_file": "samples_alias/bank_custom_cols.csv",
       "source_row": 2,
-      "counterparty": "",
-      "description": "",
+      "counterparty": "辰公司",
+      "description": "调账",
       "currency": "CNY",
       "raw_data": {
-        "交易单号": "A001",
-        "发生额": "1500.00",
-        "交易时间": "2024-01-02",
-        "往来单位": "甲公司",
-        "交易摘要": "货款",
-        "结算币种": "CNY"
+        "业务编号": "C001",
+        "收支金额": "999.99",
+        "记账日期": "2024-03-01",
+        "关联方": "辰公司",
+        "交易说明": "调账",
+        "本位币": "CNY"
       }
     },
     {
-      "txn_id": "A002",
-      "amount": 3200.5,
-      "date": "",
+      "txn_id": "C002",
+      "amount": 2345.67,
+      "date": "2024-03-05",
       "file_type": "bank_statement",
-      "source_file": "D:\\workSpace\\AI__SPACE\\zzz-00049\\samples_alias\\bank_alias_all.csv",
+      "source_file": "samples_alias/bank_custom_cols.csv",
       "source_row": 3,
-      "counterparty": "",
-      "description": "",
+      "counterparty": "巳公司",
+      "description": "尾款",
       "currency": "CNY",
       "raw_data": {
-        "交易单号": "A002",
-        "发生额": "3200.50",
-        "交易时间": "2024-01-03",
-        "往来单位": "乙公司",
-        "交易摘要": "服务费",
-        "结算币种": "CNY"
+        "业务编号": "C002",
+        "收支金额": "2345.67",
+        "记账日期": "2024-03-05",
+        "关联方": "巳公司",
+        "交易说明": "尾款",
+        "本位币": "CNY"
       }
     },
     {
-      "txn_id": "A003",
-      "amount": 2500.0,
-      "date": "",
+      "txn_id": "C003",
+      "amount": 1100.0,
+      "date": "2024-03-10",
       "file_type": "bank_statement",
-      "source_file": "D:\\workSpace\\AI__SPACE\\zzz-00049\\samples_alias\\bank_alias_all.csv",
+      "source_file": "samples_alias/bank_custom_cols.csv",
       "source_row": 4,
-      "counterparty": "",
-      "description": "",
+      "counterparty": "午公司",
+      "description": "退款",
       "currency": "CNY",
       "raw_data": {
-        "交易单号": "A003",
-        "发生额": "2,500.00",
-        "交易时间": "2024-01-05",
-        "往来单位": "丙公司",
-        "交易摘要": "货款",
-        "结算币种": "CNY"
-      }
-    },
-    {
-      "txn_id": "A004",
-      "amount": 890.0,
-      "date": "",
-      "file_type": "bank_statement",
-      "source_file": "D:\\workSpace\\AI__SPACE\\zzz-00049\\samples_alias\\bank_alias_all.csv",
-      "source_row": 5,
-      "counterparty": "",
-      "description": "",
-      "currency": "CNY",
-      "raw_data": {
-        "交易单号": "A004",
-        "发生额": "890.00",
-        "交易时间": "2024-01-06",
-        "往来单位": "丁公司",
-        "交易摘要": "手续费",
-        "结算币种": "CNY"
-      }
-    },
-    {
-      "txn_id": "A005",
-      "amount": 5600.0,
-      "date": "",
-      "file_type": "bank_statement",
-      "source_file": "D:\\workSpace\\AI__SPACE\\zzz-00049\\samples_alias\\bank_alias_all.csv",
-      "source_row": 6,
-      "counterparty": "",
-      "description": "",
-      "currency": "CNY",
-      "raw_data": {
-        "交易单号": "A005",
-        "发生额": "5600.00",
-        "交易时间": "2024-01-08",
-        "往来单位": "戊公司",
-        "交易摘要": "货款",
-        "结算币种": "CNY"
+        "业务编号": "C003",
+        "收支金额": "1100.00",
+        "记账日期": "2024-03-10",
+        "关联方": "午公司",
+        "交易说明": "退款",
+        "本位币": "CNY"
       }
     }
   ],
   "system_txns": [],
   "adjustment_txns": [],
   "discrepancies": [],
-  "exports": []
+  "exports": [],
+  "manual_link_history": []
 }

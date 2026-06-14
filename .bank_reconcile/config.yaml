@@ -5,3 +5,4 @@ column_aliases:
     发生额: amount
   manual_adjustment: {}
   system_receipt: {}
+retention_days: 365

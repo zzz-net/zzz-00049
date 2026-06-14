@@ -1,7 +1,9 @@
 README.md
 pyproject.toml
 bank_reconcile/__init__.py
+bank_reconcile/audit.py
 bank_reconcile/cli.py
+bank_reconcile/config.py
 bank_reconcile/matcher.py
 bank_reconcile/models.py
 bank_reconcile/parser.py

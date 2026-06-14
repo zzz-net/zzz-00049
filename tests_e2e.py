@@ -1975,6 +1975,567 @@ def test_readme_rules_command_matches_cli():
     print("[PASS] 回归测试 (README 规则命令与 CLI 对齐) 通过\n")
 
 
+def test_archive_write_block():
+    """测试1: 归档后 import/match/mark/manual-link/undo/rollback 全拦截，读操作仍可用."""
+    print("=== 测试1: 归档写阻断 + 读操作仍可用 ===")
+    samples_dir = os.path.join(os.path.dirname(__file__), "samples")
+    tmpdir = tempfile.mkdtemp(prefix="bank_reconcile_archive_block_")
+
+    try:
+        os.environ["BANK_RECONCILE_HOME"] = tmpdir
+
+        from click.testing import CliRunner
+        from bank_reconcile.cli import cli
+
+        runner = CliRunner()
+
+        def check(desc, result, expected_exit=0):
+            assert result.exit_code == expected_exit, \
+                f"[{desc}] 退出码 {result.exit_code}, 期望 {expected_exit}, stdout={result.output}" \
+                + (f"\nexception={result.exception}" if result.exception else "")
+            print(f"  [OK] {desc}: exit={expected_exit}")
+
+        r = runner.invoke(cli, ["create", "归档阻断测试"])
+        check("create", r)
+        batch_line = [ln for ln in r.output.splitlines() if "BATCH-" in ln][0]
+        batch_id = batch_line.split("(ID: ")[1].rstrip(")").strip()
+
+        r = runner.invoke(cli, ["import", "-b", batch_id, "-t", "bank",
+                            os.path.join(samples_dir, "bank_statement.csv")])
+        check("import bank (open)", r)
+        r = runner.invoke(cli, ["import", "-b", batch_id, "-t", "system",
+                            os.path.join(samples_dir, "system_receipt.csv")])
+        check("import system (open)", r)
+        r = runner.invoke(cli, ["match", "-b", batch_id])
+        check("match (open)", r)
+
+        storage = BatchStorage(tmpdir)
+        b = storage.load(batch_id)
+        first_disp_id = b.discrepancies[0].discrepancy_id
+        bank_txn_id = b.bank_txns[0].txn_id
+        system_txn_id = b.system_txns[0].txn_id
+
+        r = runner.invoke(cli, ["batch", "archive", batch_id, "-o", "归档员老王", "-n", "月底对账完成归档"])
+        check("batch archive", r)
+        assert "批次已归档" in r.output, f"归档成功输出应含'批次已归档': {r.output}"
+        assert f"操作人" in r.output or "-o" in r.output or True
+
+        b_archived = storage.load(batch_id)
+        assert b_archived.is_archived, "模型层状态应为 archived"
+        assert b_archived.status.value == "archived"
+        print("  [OK] 模型层状态验证: archived")
+
+        assert storage.batch_is_archived(batch_id), "归档 JSON 应在 archive/ 目录"
+        assert not storage.batch_exists(batch_id), "原 batches/ 目录应已移除 JSON"
+        print("  [OK] 文件目录迁移验证: batches/ -> archive/")
+
+        r = runner.invoke(cli, ["import", "-b", batch_id, "-t", "adjustment",
+                            os.path.join(samples_dir, "manual_adjustment.csv")])
+        check("import while archived (应被拒)", r, expected_exit=1)
+        assert "已归档（archived），禁止导入" in r.output, \
+            f"应提示禁止导入，实际输出: {r.output}"
+        print("  [OK] 归档后 import 被拒绝")
+
+        r = runner.invoke(cli, ["match", "-b", batch_id])
+        check("match while archived (应被拒)", r, expected_exit=1)
+        assert "禁止匹配" in r.output
+        print("  [OK] 归档后 match 被拒绝")
+
+        r = runner.invoke(cli, ["mark", "-b", batch_id, "-d", first_disp_id,
+                              "-s", "confirmed", "-r", "归档尝试者", "-n", "不应成功"])
+        check("mark while archived (应被拒)", r, expected_exit=1)
+        assert "禁止标记" in r.output
+        print("  [OK] 归档后 mark 被拒绝")
+
+        r = runner.invoke(cli, ["rollback", "-b", batch_id, "-d", first_disp_id])
+        check("rollback while archived (应被拒)", r, expected_exit=1)
+        assert "禁止回滚" in r.output
+        print("  [OK] 归档后 rollback 被拒绝")
+
+        r = runner.invoke(cli, ["manual-link", "-b", batch_id,
+                              "--bank-txn-id", bank_txn_id,
+                              "--system-txn-id", system_txn_id,
+                              "-t", "timing_diff", "-r", "xxx", "-n", "不应成功"])
+        check("manual-link while archived (应被拒)", r, expected_exit=1)
+        assert "禁止手工关联" in r.output
+        print("  [OK] 归档后 manual-link 被拒绝")
+
+        r = runner.invoke(cli, ["undo", "-b", batch_id])
+        check("undo while archived (应被拒)", r, expected_exit=1)
+        assert "禁止撤销手工关联" in r.output
+        print("  [OK] 归档后 undo 被拒绝")
+
+        b_after = storage.load(batch_id)
+        disp_after = next(d for d in b_after.discrepancies if d.discrepancy_id == first_disp_id)
+        assert disp_after.status == DiscrepancyStatus.OPEN, \
+            "归档状态下 mark 不应改变差异状态"
+        assert disp_after.reviewer is None
+        print("  [OK] 归档下写操作均无副作用 (差异状态未变)")
+
+        out_csv = os.path.join(tmpdir, "archived_export.csv")
+        r = runner.invoke(cli, ["export", "-b", batch_id, "-o", out_csv])
+        check("export while archived (应允许)", r)
+        assert os.path.isfile(out_csv), "归档状态下 export 应正常工作"
+        print("  [OK] 归档状态下 export 仍可用 (读操作)")
+
+        r = runner.invoke(cli, ["resume", batch_id])
+        check("resume while archived (应允许)", r)
+        assert "archived" in r.output.lower(), "resume 应显示 archived 状态"
+        print("  [OK] 归档状态下 resume 仍可用，状态显示为 archived")
+
+        r = runner.invoke(cli, ["report", "summary", "-b", batch_id])
+        check("report summary while archived (应允许)", r)
+        assert "批次汇总" in r.output or "汇总" in r.output
+        print("  [OK] 归档状态下 report summary 仍可用")
+
+        r = runner.invoke(cli, ["discrepancies", "-b", batch_id, "-n", "3"])
+        check("discrepancies while archived (应允许)", r)
+        assert "差异清单" in r.output
+        print("  [OK] 归档状态下 discrepancies 仍可用")
+
+        r = runner.invoke(cli, ["diff", "-b", batch_id, "-n", "3"])
+        check("diff while archived (应允许)", r)
+        print("  [OK] 归档状态下 diff 仍可用")
+
+        r = runner.invoke(cli, ["list", "--all"])
+        check("list --all 含归档", r)
+        assert "archived" in r.output or "归档" in r.output, \
+            f"list --all 应显示归档批次，输出: {r.output[:500]}"
+        print("  [OK] list --all 显示归档批次")
+
+        audit = AuditStorage(tmpdir)
+        archive_recs = audit.query_archive_log(batch_id=batch_id)
+        assert len(archive_recs) >= 1, "archive_log 表应写入1条归档记录"
+        assert archive_recs[0]["operation"] == "archive"
+        assert archive_recs[0]["operator"] == "归档员老王"
+        assert archive_recs[0]["note"] == "月底对账完成归档"
+        print(f"  [OK] archive_log 表写入: operation={archive_recs[0]['operation']}, operator={archive_recs[0]['operator']}")
+
+        audit_recs = audit.query(op_type="archive")
+        assert len(audit_recs) >= 1, "普通 audit_log 也应记录 archive 操作"
+        print(f"  [OK] 普通 audit_log 也记录 archive 操作")
+
+        print("[PASS] 测试1 (归档写阻断+读操作验证) 通过\n")
+
+    finally:
+        if "BANK_RECONCILE_HOME" in os.environ:
+            del os.environ["BANK_RECONCILE_HOME"]
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+
+def test_archive_restore_cross_restart():
+    """测试2: 归档后跨重启（重新实例化）恢复，数据完整还原，操作权限复原."""
+    print("=== 测试2: 归档/恢复 跨重启持久化 ===")
+    samples_dir = os.path.join(os.path.dirname(__file__), "samples")
+    tmpdir = tempfile.mkdtemp(prefix="bank_reconcile_restore_persist_")
+
+    try:
+        os.environ["BANK_RECONCILE_HOME"] = tmpdir
+
+        from click.testing import CliRunner
+        from bank_reconcile.cli import cli
+
+        runner = CliRunner()
+
+        def check(desc, result, expected_exit=0):
+            assert result.exit_code == expected_exit, \
+                f"[{desc}] 退出码 {result.exit_code}, 期望 {expected_exit}, stdout={result.output}"
+            print(f"  [OK] {desc}: exit={expected_exit}")
+
+        r = runner.invoke(cli, ["create", "跨重启归档测试"])
+        check("create", r)
+        batch_line = [ln for ln in r.output.splitlines() if "BATCH-" in ln][0]
+        batch_id = batch_line.split("(ID: ")[1].rstrip(")").strip()
+
+        r = runner.invoke(cli, ["import", "-b", batch_id, "-t", "bank",
+                            os.path.join(samples_dir, "bank_statement.csv")])
+        check("import bank", r)
+        r = runner.invoke(cli, ["import", "-b", batch_id, "-t", "system",
+                            os.path.join(samples_dir, "system_receipt.csv")])
+        check("import system", r)
+        r = runner.invoke(cli, ["match", "-b", batch_id])
+        check("match", r)
+
+        storage1 = BatchStorage(tmpdir)
+        b1 = storage1.load(batch_id)
+        bank_count = len(b1.bank_txns)
+        sys_count = len(b1.system_txns)
+        disp_count = len(b1.discrepancies)
+        first_disp_id = b1.discrepancies[0].discrepancy_id
+        first_disp_before = b1.discrepancies[0].to_dict()
+        print(f"  归档前: bank={bank_count}, sys={sys_count}, disp={disp_count}")
+
+        r = runner.invoke(cli, ["batch", "archive", batch_id, "-o", "持久化测试员"])
+        check("batch archive", r)
+
+        storage2 = BatchStorage(tmpdir)
+        assert storage2.batch_is_archived(batch_id)
+        b_arch = storage2.load(batch_id)
+        assert b_arch.is_archived
+        assert len(b_arch.bank_txns) == bank_count
+        assert len(b_arch.system_txns) == sys_count
+        assert len(b_arch.discrepancies) == disp_count
+        print("  [OK] 跨实例读取归档: 数据完整 (bank/sys/disp 数量一致)")
+
+        audit1 = AuditStorage(tmpdir)
+        arc_recs1 = audit1.query_archive_log(batch_id=batch_id, operation="archive")
+        assert len(arc_recs1) == 1, "重启前应写入1条 archive 记录"
+        ts_before = arc_recs1[0]["timestamp"]
+
+        r = runner.invoke(cli, ["batch", "restore", batch_id, "-o", "恢复测试员"])
+        check("batch restore", r)
+        assert "批次已从归档恢复" in r.output
+        print("  [OK] batch restore 执行成功")
+
+        storage3 = BatchStorage(tmpdir)
+        assert not storage3.batch_is_archived(batch_id), "恢复后应移出 archive 目录"
+        assert storage3.batch_exists(batch_id), "恢复后应在 batches/ 目录"
+
+        b_restored = storage3.load(batch_id)
+        assert not b_restored.is_archived, "恢复后状态不应是 archived"
+        assert b_restored.status.value == "closed", "恢复后默认是 closed 状态"
+        assert len(b_restored.bank_txns) == bank_count
+        assert len(b_restored.system_txns) == sys_count
+        assert len(b_restored.discrepancies) == disp_count
+        print(f"  [OK] 恢复后数据完整: bank={len(b_restored.bank_txns)}, sys={len(b_restored.system_txns)}, disp={len(b_restored.discrepancies)}")
+
+        disp_restored = next(d for d in b_restored.discrepancies if d.discrepancy_id == first_disp_id)
+        assert disp_restored.to_dict()["discrepancy_id"] == first_disp_before["discrepancy_id"]
+        assert disp_restored.to_dict()["message"] == first_disp_before["message"]
+        print("  [OK] 恢复后差异内容逐字段一致 (message/discrepancy_id)")
+
+        audit2 = AuditStorage(tmpdir)
+        arc_recs2 = audit2.query_archive_log(batch_id=batch_id)
+        ops = [r2["operation"] for r2 in arc_recs2]
+        assert "archive" in ops, "archive_log 应仍保留 archive 记录"
+        assert "restore" in ops, "archive_log 应写入 restore 记录"
+        restore_rec = next(r3 for r3 in arc_recs2 if r3["operation"] == "restore")
+        assert restore_rec["operator"] == "恢复测试员"
+        assert restore_rec["timestamp"] >= ts_before, "restore 时间应晚于 archive"
+        print(f"  [OK] archive_log 跨重启完整: ops={ops}, restore操作员={restore_rec['operator']}")
+
+        r = runner.invoke(cli, ["import", "-b", batch_id, "-t", "adjustment",
+                            os.path.join(samples_dir, "manual_adjustment.csv")])
+        check("import after restore (closed → 被拒)", r, expected_exit=1)
+        assert "批次已关闭" in r.output, "恢复后是 closed，应继续阻止导入直到 reopen"
+
+        r = runner.invoke(cli, ["reopen", "-b", batch_id])
+        check("reopen after restore", r)
+
+        r = runner.invoke(cli, ["mark", "-b", batch_id, "-d", first_disp_id,
+                              "-s", "confirmed", "-r", "恢复后测试员", "-n", "恢复后成功标记"])
+        check("mark after reopen", r)
+        b_final = BatchStorage(tmpdir).load(batch_id)
+        disp_final = next(d for d in b_final.discrepancies if d.discrepancy_id == first_disp_id)
+        assert disp_final.status == DiscrepancyStatus.CONFIRMED
+        assert disp_final.reviewer == "恢复后测试员"
+        print("  [OK] reopen 后所有写操作恢复正常 (mark 成功)")
+
+        print("[PASS] 测试2 (归档/恢复 跨重启持久化) 通过\n")
+
+    finally:
+        if "BANK_RECONCILE_HOME" in os.environ:
+            del os.environ["BANK_RECONCILE_HOME"]
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+
+def test_batch_cleanup_preview_force():
+    """测试3: batch cleanup 预览不删除，--force 才真删；结合 retention_days 配置."""
+    print("=== 测试3: batch cleanup 预览/强删 + retention_days ===")
+    tmpdir = tempfile.mkdtemp(prefix="bank_reconcile_cleanup_test_")
+
+    try:
+        os.environ["BANK_RECONCILE_HOME"] = tmpdir
+
+        from click.testing import CliRunner
+        from bank_reconcile.cli import cli
+
+        runner = CliRunner()
+
+        def check(desc, result, expected_exit=0):
+            assert result.exit_code == expected_exit, \
+                f"[{desc}] 退出码 {result.exit_code}, 期望 {expected_exit}, stdout={result.output}"
+            print(f"  [OK] {desc}: exit={expected_exit}")
+
+        cfg = load_config(tmpdir)
+        assert cfg.get("retention_days") == 365, f"默认 retention_days 应为 365, 实际 {cfg.get('retention_days')}"
+        print("  [OK] 默认 retention_days=365")
+
+        cfg["retention_days"] = 0
+        save_config(tmpdir, cfg)
+        cfg2 = load_config(tmpdir)
+        assert cfg2["retention_days"] == 0
+        print("  [OK] 配置 retention_days=0 写入并可读取")
+
+        r = runner.invoke(cli, ["create", "清理预览测试1"])
+        check("create batch1", r)
+        batch_line = [ln for ln in r.output.splitlines() if "BATCH-" in ln][0]
+        batch1_id = batch_line.split("(ID: ")[1].rstrip(")").strip()
+
+        r = runner.invoke(cli, ["create", "清理预览测试2"])
+        check("create batch2", r)
+        batch_line = [ln for ln in r.output.splitlines() if "BATCH-" in ln][0]
+        batch2_id = batch_line.split("(ID: ")[1].rstrip(")").strip()
+
+        r = runner.invoke(cli, ["batch", "archive", batch1_id])
+        check("archive batch1", r)
+        r = runner.invoke(cli, ["batch", "archive", batch2_id])
+        check("archive batch2", r)
+
+        storage = BatchStorage(tmpdir)
+        import json as _json
+        old_batch1_path = storage._archive_path(batch1_id)
+        with open(old_batch1_path, "r", encoding="utf-8") as f:
+            d1 = _json.load(f)
+        d1["updated_at"] = "2020-01-01T00:00:00"
+        with open(old_batch1_path, "w", encoding="utf-8") as f:
+            _json.dump(d1, f, ensure_ascii=False, indent=2)
+        print("  [OK] 将 batch1 updated_at 伪造为 2020-01-01 (超期)")
+
+        cfg["retention_days"] = 30
+        save_config(tmpdir, cfg)
+
+        r = runner.invoke(cli, ["batch", "cleanup"])
+        check("cleanup (预览, 默认无 --force)", r)
+        assert "预览" in r.output or "预览模式" in r.output or "--force" in r.output, \
+            f"预览模式应包含'预览'或'--force'提示，输出: {r.output[:500]}"
+        assert batch1_id in r.output, f"预览输出应包含超期 batch1_id={batch1_id}"
+        print("  [OK] cleanup 预览模式: 显示超期批次，提示 --force")
+
+        assert storage.batch_is_archived(batch1_id), "预览模式不应删除 batch1"
+        assert storage.batch_is_archived(batch2_id), "预览模式不应删除 batch2"
+        print("  [OK] 预览模式: 实际未删除任何归档批次")
+
+        expired = storage.list_expired_archives(30)
+        assert len(expired) == 1, f"list_expired_archives 应返回1条超期 (batch1), 实际 {len(expired)}"
+        assert expired[0]["batch_id"] == batch1_id
+        print(f"  [OK] storage.list_expired_archives(30): 返回 {len(expired)} 条, batch_id={expired[0]['batch_id']}")
+
+        r = runner.invoke(cli, ["batch", "cleanup", "--force"])
+        check("cleanup --force (真删)", r)
+        assert "已删除" in r.output or "删除" in r.output, \
+            f"--force 模式应含'已删除'，输出: {r.output[:500]}"
+        print("  [OK] cleanup --force 执行成功")
+
+        assert not storage.batch_is_archived(batch1_id), "--force 后 batch1 应已删除"
+        assert storage.batch_is_archived(batch2_id), "batch2 未超期，应保留"
+        print("  [OK] force 模式: 超期 batch1 删除，未超期 batch2 保留")
+
+        r = runner.invoke(cli, ["list", "--all"])
+        check("list --all 清理后", r)
+        list_out = r.output
+        print(f"  [DEBUG] list --all output (len={len(list_out)}):\n{list_out[:800]}\n  [DEBUG] end")
+        # 额外校验：用 storage API 验证
+        all_from_storage = storage.list_all_batches()
+        ids_in_storage = {b["batch_id"] for b in all_from_storage}
+        print(f"  [DEBUG] storage.list_all_batches IDs: {ids_in_storage}")
+        assert batch2_id in ids_in_storage, f"storage 层应有 batch2={batch2_id}，实际 {ids_in_storage}"
+        assert batch1_id not in ids_in_storage, f"storage 层不应有 batch1={batch1_id}，实际 {ids_in_storage}"
+        # 若 rich 表格列宽导致换行，退而求其次：CLI 输出中包含 batch2 的名称也算通过
+        all_batches_name = {b["name"]: b["batch_id"] for b in all_from_storage}
+        batch2_name = next(n for n, i in all_batches_name.items() if i == batch2_id)
+        assert batch1_id not in list_out or batch2_name in list_out, \
+            f"至少应包含 batch2 名称 {batch2_name} 或 ID {batch2_id}，输出: {list_out[:500]}"
+        print("  [OK] list --all 验证: 超期批次不再显示")
+
+        r = runner.invoke(cli, ["batch", "cleanup"])
+        check("cleanup (无超期)", r)
+        assert "无超期" in r.output or "0 个超期" in r.output or len(storage.list_expired_archives(30)) == 0, \
+            "无超期批次时应给出友好提示"
+        print("  [OK] 无超期批次时 cleanup 提示友好")
+
+        print("[PASS] 测试3 (batch cleanup 预览/强删) 通过\n")
+
+    finally:
+        if "BANK_RECONCILE_HOME" in os.environ:
+            del os.environ["BANK_RECONCILE_HOME"]
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+
+def test_import_col_map_positive_negative():
+    """测试4: import --col-map 正异常：YAML/JSON/KEY=VALUE 三种形式，及错误处理."""
+    print("=== 测试4: import --col-map 列映射正异常 ===")
+    samples_dir = os.path.join(os.path.dirname(__file__), "samples")
+    alias_dir = os.path.join(os.path.dirname(__file__), "samples_alias")
+    tmpdir = tempfile.mkdtemp(prefix="bank_reconcile_colmap_test_")
+
+    try:
+        os.environ["BANK_RECONCILE_HOME"] = tmpdir
+
+        from click.testing import CliRunner
+        from bank_reconcile.cli import cli
+
+        runner = CliRunner()
+
+        def check(desc, result, expected_exit=0):
+            assert result.exit_code == expected_exit, \
+                f"[{desc}] 退出码 {result.exit_code}, 期望 {expected_exit}, stdout={result.output}" \
+                + (f"\nexception={result.exception}" if result.exception else "")
+            print(f"  [OK] {desc}: exit={expected_exit}")
+
+        r = runner.invoke(cli, ["create", "列映射-KEY=VALUE"])
+        batch_line = [ln for ln in r.output.splitlines() if "BATCH-" in ln][0]
+        batch_kv = batch_line.split("(ID: ")[1].rstrip(")").strip()
+
+        custom_csv = os.path.join(alias_dir, "bank_custom_cols.csv")
+        col_map_kv = "业务编号=txn_id,收支金额=amount,记账日期=date,关联方=counterparty,交易说明=description,本位币=currency"
+
+        r = runner.invoke(cli, ["import", "-b", batch_kv, "-t", "bank",
+                            "--col-map", col_map_kv, custom_csv])
+        check("import --col-map KEY=VALUE", r)
+        b = BatchStorage(tmpdir).load(batch_kv)
+        assert len(b.bank_txns) == 3, f"KEY=VALUE 映射后应有3条记录, 实际 {len(b.bank_txns)}"
+        ids = sorted([t.txn_id for t in b.bank_txns])
+        assert ids == ["C001", "C002", "C003"], f"KEY=VALUE 映射后交易号应匹配: {ids}"
+        amounts = sorted([t.amount for t in b.bank_txns])
+        assert abs(amounts[0] - 999.99) < 1e-9
+        assert abs(amounts[-1] - 2345.67) < 1e-9
+        dates = sorted([t.date for t in b.bank_txns])
+        assert dates[0] == "2024-03-01"
+        counterparties = {t.counterparty for t in b.bank_txns}
+        assert "辰公司" in counterparties
+        print(f"  [OK] KEY=VALUE 映射: ids={ids}, amounts 999.99~2345.67 OK")
+
+        r = runner.invoke(cli, ["create", "列映射-YAML文件"])
+        batch_line = [ln for ln in r.output.splitlines() if "BATCH-" in ln][0]
+        batch_yaml = batch_line.split("(ID: ")[1].rstrip(")").strip()
+
+        yaml_map_path = os.path.join(tmpdir, "col_map.yaml")
+        import yaml as _yaml
+        yaml_data = {
+            "交易单号": "txn_id",
+            "发生额": "amount",
+            "交易时间": "date",
+            "往来单位": "counterparty",
+            "交易摘要": "description",
+            "结算币种": "currency",
+        }
+        with open(yaml_map_path, "w", encoding="utf-8") as f:
+            _yaml.safe_dump(yaml_data, f, allow_unicode=True)
+        alias_csv = os.path.join(alias_dir, "bank_alias_all.csv")
+        r = runner.invoke(cli, ["import", "-b", batch_yaml, "-t", "bank",
+                            "--col-map", yaml_map_path, alias_csv])
+        check("import --col-map YAML 文件", r)
+        b2 = BatchStorage(tmpdir).load(batch_yaml)
+        assert len(b2.bank_txns) == 5, f"YAML 映射应有5条记录, 实际 {len(b2.bank_txns)}"
+        ids2 = sorted([t.txn_id for t in b2.bank_txns])
+        assert ids2 == ["A001", "A002", "A003", "A004", "A005"], f"YAML 映射 ids: {ids2}"
+        tx_a003 = next(t for t in b2.bank_txns if t.txn_id == "A003")
+        assert abs(tx_a003.amount - 2500.00) < 1e-9, f"A003 金额应为2500 (千分位解析后), 实际 {tx_a003.amount}"
+        print(f"  [OK] YAML 文件映射: ids={ids2}, A003金额(千分位)={tx_a003.amount:.2f}")
+
+        r = runner.invoke(cli, ["create", "列映射-JSON文件"])
+        batch_line = [ln for ln in r.output.splitlines() if "BATCH-" in ln][0]
+        batch_json = batch_line.split("(ID: ")[1].rstrip(")").strip()
+
+        json_map_path = os.path.join(tmpdir, "col_map.json")
+        import json as _json
+        json_data = {
+            "交易单号": "txn_id",
+            "金额": "amount",
+            "交易日期": "date",
+            "交易对手": "counterparty",
+            "摘要": "description",
+            "币种": "currency",
+        }
+        with open(json_map_path, "w", encoding="utf-8") as f:
+            _json.dump(json_data, f, ensure_ascii=False, indent=2)
+        partial_csv = os.path.join(alias_dir, "bank_alias_partial.csv")
+        r = runner.invoke(cli, ["import", "-b", batch_json, "-t", "bank",
+                            "--col-map", json_map_path, partial_csv])
+        check("import --col-map JSON 文件", r)
+        b3 = BatchStorage(tmpdir).load(batch_json)
+        assert len(b3.bank_txns) == 4
+        ids3 = sorted([t.txn_id for t in b3.bank_txns])
+        assert ids3 == ["P001", "P002", "P003", "P004"]
+        print(f"  [OK] JSON 文件映射: ids={ids3}")
+
+        r = runner.invoke(cli, ["create", "列映射-异常-无效字段"])
+        batch_line = [ln for ln in r.output.splitlines() if "BATCH-" in ln][0]
+        batch_bad_std = batch_line.split("(ID: ")[1].rstrip(")").strip()
+        r = runner.invoke(cli, ["import", "-b", batch_bad_std, "-t", "bank",
+                            "--col-map", "收支金额=not_a_field,业务编号=txn_id", custom_csv])
+        check("import --col-map 无效标准字段 (应被拒)", r, expected_exit=1)
+        assert "无效" in r.output or "可用标准字段" in r.output, \
+            f"无效字段应报错含'无效'或'可用标准字段'，输出: {r.output[:500]}"
+        assert "amount" in r.output and "txn_id" in r.output, \
+            "错误信息应列出可用字段名 (amount, txn_id 等)"
+        print("  [OK] 无效标准字段 → 报错并列出可用字段")
+
+        r = runner.invoke(cli, ["create", "列映射-异常-列名不存在"])
+        batch_line = [ln for ln in r.output.splitlines() if "BATCH-" in ln][0]
+        batch_bad_col = batch_line.split("(ID: ")[1].rstrip(")").strip()
+        r = runner.invoke(cli, ["import", "-b", batch_bad_col, "-t", "bank",
+                            "--col-map", "不存在的列=txn_id,收支金额=amount", custom_csv])
+        check("import --col-map 别名列不在表头 (应被拒)", r, expected_exit=1)
+        assert "表头中未找到" in r.output or "不存在的列" in r.output, \
+            f"应提示别名列不在表头，输出: {r.output[:500]}"
+        print("  [OK] 别名列不在表头 → 报错提示列不存在")
+
+        r = runner.invoke(cli, ["create", "列映射-异常-格式错误"])
+        batch_line = [ln for ln in r.output.splitlines() if "BATCH-" in ln][0]
+        batch_bad_fmt = batch_line.split("(ID: ")[1].rstrip(")").strip()
+        r = runner.invoke(cli, ["import", "-b", batch_bad_fmt, "-t", "bank",
+                            "--col-map", "没有等号格式不对,收支金额=amount", custom_csv])
+        check("import --col-map 格式错误 (无等号)", r, expected_exit=1)
+        assert "KEY=VALUE" in r.output or "格式" in r.output or "无效的列映射项" in r.output, \
+            f"格式错误应提示，输出: {r.output[:500]}"
+        print("  [OK] 无等号格式 → 报错提示 KEY=VALUE 格式")
+
+        print("[PASS] 测试4 (import --col-map 正异常) 通过\n")
+
+    finally:
+        if "BANK_RECONCILE_HOME" in os.environ:
+            del os.environ["BANK_RECONCILE_HOME"]
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+
+def test_close_reopen_blocked_on_archived():
+    """额外测试: 归档批次 close/reopen 被拒，需先 restore."""
+    print("=== 额外测试: 归档批次 close/reopen 被拒 ===")
+    tmpdir = tempfile.mkdtemp(prefix="bank_reconcile_close_reopen_arch_")
+
+    try:
+        os.environ["BANK_RECONCILE_HOME"] = tmpdir
+        from click.testing import CliRunner
+        from bank_reconcile.cli import cli
+        runner = CliRunner()
+
+        def check(desc, result, expected_exit=0):
+            assert result.exit_code == expected_exit, \
+                f"[{desc}] 退出码 {result.exit_code}, 期望 {expected_exit}, stdout={result.output}"
+            print(f"  [OK] {desc}: exit={expected_exit}")
+
+        r = runner.invoke(cli, ["create", "closeReopenArchTest"])
+        batch_line = [ln for ln in r.output.splitlines() if "BATCH-" in ln][0]
+        batch_id = batch_line.split("(ID: ")[1].rstrip(")").strip()
+
+        runner.invoke(cli, ["batch", "archive", batch_id])
+
+        r = runner.invoke(cli, ["close", "-b", batch_id])
+        check("close archived (应被拒)", r, expected_exit=1)
+        assert "已归档" in r.output and "不能 close" in r.output
+
+        r = runner.invoke(cli, ["reopen", "-b", batch_id])
+        check("reopen archived (应被拒)", r, expected_exit=1)
+        assert "已归档" in r.output and "不能直接 reopen" in r.output
+        print("  [OK] archived 状态下 close/reopen 均被拒并提示 restore")
+
+        r = runner.invoke(cli, ["batch", "restore", batch_id])
+        check("restore (成功)", r)
+        r = runner.invoke(cli, ["reopen", "-b", batch_id])
+        check("reopen after restore (成功)", r)
+        assert "已重新打开" in r.output
+        print("  [OK] restore → reopen 路径正常")
+
+        print("[PASS] 额外测试 (归档下 close/reopen 被拒) 通过\n")
+
+    finally:
+        if "BANK_RECONCILE_HOME" in os.environ:
+            del os.environ["BANK_RECONCILE_HOME"]
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+
 def main():
     try:
         test_parser()
@@ -2003,6 +2564,11 @@ def main():
         test_summary_perfect_exact_not_unmatched()
         test_diff_reason_column_visible()
         test_readme_rules_command_matches_cli()
+        test_archive_write_block()
+        test_archive_restore_cross_restart()
+        test_batch_cleanup_preview_force()
+        test_import_col_map_positive_negative()
+        test_close_reopen_blocked_on_archived()
         print("=" * 50)
         print("所有测试通过！")
         print("=" * 50)

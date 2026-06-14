@@ -49,13 +49,79 @@ def _maybe_cleanup_audit(audit: AuditStorage, storage: BatchStorage) -> None:
             pass
 
 
+def _check_archived_write_block(batch: Batch, action: str) -> None:
+    """如果批次已归档，阻断写操作并退出."""
+    if batch.is_archived:
+        console.print(
+            f"[red]ERR[/] 批次已归档（archived），禁止{action}。\n"
+            f"  请先执行 [cyan]bank-reconcile batch restore {batch.batch_id}[/] 恢复后再操作。"
+        )
+        sys.exit(1)
+
+
+def _parse_col_map_raw(col_map_raw: str) -> Dict[str, str]:
+    """解析 --col-map 参数，支持 YAML/JSON 文件或 KEY=VALUE 格式."""
+    if not col_map_raw:
+        return {}
+
+    if os.path.isfile(col_map_raw):
+        ext = os.path.splitext(col_map_raw)[1].lower()
+        try:
+            with open(col_map_raw, "r", encoding="utf-8") as f:
+                content = f.read()
+            if ext in (".yaml", ".yml"):
+                import yaml
+                data = yaml.safe_load(content)
+            elif ext == ".json":
+                import json
+                data = json.loads(content)
+            else:
+                import yaml
+                try:
+                    data = yaml.safe_load(content)
+                except Exception:
+                    import json
+                    data = json.loads(content)
+            if not isinstance(data, dict):
+                raise ValueError("列映射文件内容必须是对象（键值对）")
+            return {str(k): str(v) for k, v in data.items()}
+        except Exception as e:
+            raise ValueError(f"解析列映射文件 {col_map_raw} 失败: {e}")
+
+    result: Dict[str, str] = {}
+    for item in col_map_raw.split(","):
+        item = item.strip()
+        if not item:
+            continue
+        if "=" not in item:
+            raise ValueError(
+                f"无效的列映射项 '{item}'，应为 KEY=VALUE 格式，多个用逗号分隔，\n"
+                f"或传 YAML/JSON 文件路径。"
+            )
+        k, v = item.split("=", 1)
+        k = k.strip()
+        v = v.strip()
+        if not k or not v:
+            raise ValueError(f"无效的列映射项 '{item}'，键和值都不能为空")
+        result[k] = v
+    return result
+
+
 def _print_batch_info(batch: Batch) -> None:
     summary = generate_summary(batch)
-    status_style = "green" if batch.status == BatchStatus.OPEN else "dim"
+    if batch.is_archived:
+        status_style = "dim"
+        status_text = f"[bold {status_style}]状态: {batch.status.value} (已归档)[/]"
+    elif batch.status == BatchStatus.OPEN:
+        status_style = "green"
+        status_text = f"[bold {status_style}]状态: {batch.status.value}[/]"
+    else:
+        status_style = "yellow"
+        status_text = f"[bold {status_style}]状态: {batch.status.value}[/]"
     console.print(Panel.fit(
         f"[bold cyan]批次:[/] {summary['batch_name']}  "
         f"[dim]({summary['batch_id']})[/]  "
-        f"[bold {status_style}]状态: {batch.status.value}[/]\n"
+        f"{status_text}\n"
         f"银行回单: {summary['bank_transactions']}  "
         f"系统流水: {summary['system_transactions']}  "
         f"手工调整: {summary['adjustment_transactions']}\n"
@@ -83,17 +149,23 @@ def create(name: str) -> None:
 
 # ── list ──────────────────────────────────────────────────
 @cli.command(name="list", help="列出所有批次")
-def list_batches() -> None:
+@click.option("--all", "-a", "show_all", is_flag=True, help="同时列出归档目录中的批次")
+def list_batches(show_all: bool) -> None:
     storage = _get_storage()
-    batches = storage.list_batches()
+    if show_all:
+        batches = storage.list_all_batches()
+    else:
+        batches = storage.list_batches()
     if not batches:
         console.print("[yellow]尚无批次[/], 使用 [cyan]bank-reconcile create <名称>[/] 创建")
         return
 
-    table = Table(title="批次列表")
+    table = Table(title="批次列表" + ("（含归档）" if show_all else ""))
     table.add_column("批次ID", style="cyan")
     table.add_column("名称", style="bold")
     table.add_column("状态", style="bold")
+    if show_all:
+        table.add_column("位置", style="dim")
     table.add_column("创建时间", style="dim")
     table.add_column("更新时间", style="dim")
     table.add_column("差异数", justify="right")
@@ -101,16 +173,29 @@ def list_batches() -> None:
 
     for b in batches:
         status = b.get("status", "open")
-        status_style = "green" if status == "open" else "dim"
-        table.add_row(
+        if status == "archived":
+            status_style = "dim"
+            status_label = "archived(已归档)"
+        elif status == "open":
+            status_style = "green"
+            status_label = status
+        else:
+            status_style = "yellow"
+            status_label = status
+        row_items = [
             b["batch_id"],
             b["name"],
-            f"[{status_style}]{status}[/]",
+            f"[{status_style}]{status_label}[/]",
+        ]
+        if show_all:
+            row_items.append(b.get("location", "active"))
+        row_items.extend([
             b["created_at"][:19].replace("T", " "),
             b["updated_at"][:19].replace("T", " "),
             str(b["discrepancy_count"]),
             str(b["imported_files"]),
-        )
+        ])
+        table.add_row(*row_items)
     console.print(table)
 
 
@@ -120,10 +205,12 @@ def list_batches() -> None:
 @click.option("--type", "-t", "file_type", required=True,
               type=click.Choice(["bank", "system", "adjustment"]),
               help="文件类型")
+@click.option("--col-map", "col_map_raw", default=None,
+              help="列名映射: 传 YAML/JSON 文件路径, 或 KEY=VALUE 用逗号分隔。如 --col-map 收入金额=amount,交易号=txn_id")
 @click.argument("file_path")
-def import_file(batch_id: str, file_type: str, file_path: str) -> None:
+def import_file(batch_id: str, file_type: str, file_path: str, col_map_raw: Optional[str]) -> None:
     storage = _get_storage()
-    if not storage.batch_exists(batch_id):
+    if not storage.batch_exists_anywhere(batch_id):
         console.print(f"[red]ERR[/] 批次不存在: {batch_id}")
         sys.exit(1)
 
@@ -132,6 +219,7 @@ def import_file(batch_id: str, file_type: str, file_path: str) -> None:
     if batch.is_closed:
         console.print(f"[red]ERR[/] 批次已关闭（closed），禁止导入。请先 reopen 后再操作。")
         sys.exit(1)
+    _check_archived_write_block(batch, "导入")
 
     type_map = {
         "bank": FileType.BANK_STATEMENT,
@@ -141,7 +229,13 @@ def import_file(batch_id: str, file_type: str, file_path: str) -> None:
     ft = type_map[file_type]
 
     try:
-        result, imported = parse_file(file_path, ft, storage_dir=storage.storage_dir)
+        extra_col_map = _parse_col_map_raw(col_map_raw) if col_map_raw else None
+    except ValueError as e:
+        console.print(f"[red]ERR[/] --col-map 参数错误: {e}")
+        sys.exit(1)
+
+    try:
+        result, imported = parse_file(file_path, ft, storage_dir=storage.storage_dir, extra_col_map=extra_col_map)
     except FileNotFoundError as e:
         console.print(f"[red]ERR[/] {e}")
         sys.exit(1)
@@ -204,9 +298,12 @@ def rules_group() -> None:
 @click.argument("rule_file")
 def rules_set(batch_id: str, rule_file: str) -> None:
     storage = _get_storage()
-    if not storage.batch_exists(batch_id):
+    if not storage.batch_exists_anywhere(batch_id):
         console.print(f"[red]ERR[/] 批次不存在: {batch_id}")
         sys.exit(1)
+
+    batch = storage.load(batch_id)
+    _check_archived_write_block(batch, "设置规则")
 
     try:
         rules_obj = load_rules(rule_file)
@@ -276,7 +373,7 @@ def rules_export(batch_id: Optional[str], use_default: bool, output_file: str) -
         rules_obj = MatchRules.default()
     elif batch_id:
         storage = _get_storage()
-        if not storage.batch_exists(batch_id):
+        if not storage.batch_exists_anywhere(batch_id):
             console.print(f"[red]ERR[/] 批次不存在: {batch_id}")
             sys.exit(1)
         batch = storage.load(batch_id)
@@ -311,7 +408,7 @@ def rules_import(batch_id: Optional[str], force: bool, rule_file: str) -> None:
 
     existing_rules: Optional[MatchRules] = None
     if batch_id:
-        if not storage or not storage.batch_exists(batch_id):
+        if not storage or not storage.batch_exists_anywhere(batch_id):
             console.print(f"[red]ERR[/] 批次不存在: {batch_id}")
             sys.exit(1)
         batch = storage.load(batch_id)
@@ -337,6 +434,7 @@ def rules_import(batch_id: Optional[str], force: bool, rule_file: str) -> None:
     if batch_id and storage:
         dest_path = os.path.abspath(rule_file)
         batch = storage.load(batch_id)
+        _check_archived_write_block(batch, "设置规则文件关联")
         batch.rule_file = dest_path
         storage.save(batch)
         console.print(f"[green]OK[/] 规则已导入并关联到批次 {batch_id}")
@@ -357,7 +455,7 @@ def report_group() -> None:
 @click.option("--export", "export_path", default=None, help="导出 CSV 文件路径")
 def report_summary(batch_id: str, export_path: Optional[str]) -> None:
     storage = _get_storage()
-    if not storage.batch_exists(batch_id):
+    if not storage.batch_exists_anywhere(batch_id):
         console.print(f"[red]ERR[/] 批次不存在: {batch_id}")
         sys.exit(1)
 
@@ -400,7 +498,7 @@ def report_summary(batch_id: str, export_path: Optional[str]) -> None:
 @click.option("--rule-file", "-r", default=None, help="规则文件路径（可选，优先级高于批次已设置的规则）")
 def match(batch_id: str, rule_file: Optional[str]) -> None:
     storage = _get_storage()
-    if not storage.batch_exists(batch_id):
+    if not storage.batch_exists_anywhere(batch_id):
         console.print(f"[red]ERR[/] 批次不存在: {batch_id}")
         sys.exit(1)
 
@@ -409,6 +507,7 @@ def match(batch_id: str, rule_file: Optional[str]) -> None:
     if batch.is_closed:
         console.print(f"[red]ERR[/] 批次已关闭（closed），禁止匹配。请先 reopen 后再操作。")
         sys.exit(1)
+    _check_archived_write_block(batch, "匹配")
 
     rule_path = rule_file or batch.rule_file
     try:
@@ -489,7 +588,7 @@ def match(batch_id: str, rule_file: Optional[str]) -> None:
 @click.option("--limit", "-n", default=20, help="显示条数")
 def list_discrepancies(batch_id: str, status: Optional[str], disp_type: Optional[str], limit: int) -> None:
     storage = _get_storage()
-    if not storage.batch_exists(batch_id):
+    if not storage.batch_exists_anywhere(batch_id):
         console.print(f"[red]ERR[/] 批次不存在: {batch_id}")
         sys.exit(1)
 
@@ -536,7 +635,7 @@ def list_discrepancies(batch_id: str, status: Optional[str], disp_type: Optional
 @click.option("--note", "-n", default="", help="备注")
 def mark(batch_id: str, discrepancy_id: str, status: str, reviewer: str, note: str) -> None:
     storage = _get_storage()
-    if not storage.batch_exists(batch_id):
+    if not storage.batch_exists_anywhere(batch_id):
         console.print(f"[red]ERR[/] 批次不存在: {batch_id}")
         sys.exit(1)
 
@@ -545,6 +644,7 @@ def mark(batch_id: str, discrepancy_id: str, status: str, reviewer: str, note: s
     if batch.is_closed:
         console.print(f"[red]ERR[/] 批次已关闭（closed），禁止标记。请先 reopen 后再操作。")
         sys.exit(1)
+    _check_archived_write_block(batch, "标记")
 
     target_status = DiscrepancyStatus(status)
 
@@ -582,7 +682,7 @@ def mark(batch_id: str, discrepancy_id: str, status: str, reviewer: str, note: s
 @click.option("--discrepancy-id", "-d", required=True, help="差异ID")
 def rollback(batch_id: str, discrepancy_id: str) -> None:
     storage = _get_storage()
-    if not storage.batch_exists(batch_id):
+    if not storage.batch_exists_anywhere(batch_id):
         console.print(f"[red]ERR[/] 批次不存在: {batch_id}")
         sys.exit(1)
 
@@ -591,6 +691,7 @@ def rollback(batch_id: str, discrepancy_id: str) -> None:
     if batch.is_closed:
         console.print(f"[red]ERR[/] 批次已关闭（closed），禁止回滚。请先 reopen 后再操作。")
         sys.exit(1)
+    _check_archived_write_block(batch, "回滚")
 
     found = None
     for d in batch.discrepancies:
@@ -618,7 +719,7 @@ def rollback(batch_id: str, discrepancy_id: str) -> None:
 def resume(batch_id: str) -> None:
     """恢复批次 - 显示批次详情，确认状态完整保留."""
     storage = _get_storage()
-    if not storage.batch_exists(batch_id):
+    if not storage.batch_exists_anywhere(batch_id):
         console.print(f"[red]ERR[/] 批次不存在: {batch_id}")
         sys.exit(1)
 
@@ -686,7 +787,7 @@ def resume(batch_id: str) -> None:
 @click.option("--with-summary", is_flag=True, help="同时导出摘要")
 def export(batch_id: str, output: str, status: Optional[str], disp_type: Optional[str], with_summary: bool) -> None:
     storage = _get_storage()
-    if not storage.batch_exists(batch_id):
+    if not storage.batch_exists_anywhere(batch_id):
         console.print(f"[red]ERR[/] 批次不存在: {batch_id}")
         sys.exit(1)
 
@@ -708,15 +809,19 @@ def export(batch_id: str, output: str, status: Optional[str], disp_type: Optiona
 
 
 # ── close ─────────────────────────────────────────────────
-@cli.command(help="关闭批次（归档），关闭后禁止导入/匹配/标记/回滚")
+@cli.command(help="关闭批次，关闭后禁止导入/匹配/标记/回滚")
 @click.option("--batch-id", "-b", required=True, help="批次ID")
 def close(batch_id: str) -> None:
     storage = _get_storage()
-    if not storage.batch_exists(batch_id):
+    if not storage.batch_exists_anywhere(batch_id):
         console.print(f"[red]ERR[/] 批次不存在: {batch_id}")
         sys.exit(1)
 
     batch = storage.load(batch_id)
+    if batch.is_archived:
+        console.print(f"[red]ERR[/] 批次已归档（archived），不能 close。\n"
+                      f"  请先 [cyan]bank-reconcile batch restore {batch_id}[/] 后再操作。")
+        sys.exit(1)
     changed = batch.close()
     storage.save(batch)
 
@@ -735,11 +840,15 @@ def close(batch_id: str) -> None:
 @click.option("--batch-id", "-b", required=True, help="批次ID")
 def reopen(batch_id: str) -> None:
     storage = _get_storage()
-    if not storage.batch_exists(batch_id):
+    if not storage.batch_exists_anywhere(batch_id):
         console.print(f"[red]ERR[/] 批次不存在: {batch_id}")
         sys.exit(1)
 
     batch = storage.load(batch_id)
+    if batch.is_archived:
+        console.print(f"[red]ERR[/] 批次已归档（archived），不能直接 reopen。\n"
+                      f"  请先 [cyan]bank-reconcile batch restore {batch_id}[/] 后再 reopen。")
+        sys.exit(1)
     changed = batch.reopen()
     storage.save(batch)
 
@@ -942,7 +1051,7 @@ def _build_diff_rows(batch: Batch):
 @click.option("--export", "export_path", default=None, help="导出 CSV 文件路径")
 def diff(batch_id: str, limit: int, export_path: str) -> None:
     storage = _get_storage()
-    if not storage.batch_exists(batch_id):
+    if not storage.batch_exists_anywhere(batch_id):
         console.print(f"[red]ERR[/] 批次不存在: {batch_id}")
         sys.exit(1)
 
@@ -1028,7 +1137,7 @@ def diff(batch_id: str, limit: int, export_path: str) -> None:
 def manual_link(batch_id: str, bank_txn_id: str, system_txn_id: str,
                 adj_type: str, reviewer: str, note: str) -> None:
     storage = _get_storage()
-    if not storage.batch_exists(batch_id):
+    if not storage.batch_exists_anywhere(batch_id):
         console.print(f"[red]ERR[/] 批次不存在: {batch_id}")
         sys.exit(1)
 
@@ -1037,6 +1146,7 @@ def manual_link(batch_id: str, bank_txn_id: str, system_txn_id: str,
     if batch.is_closed:
         console.print(f"[red]ERR[/] 批次已关闭（closed），禁止操作。请先 reopen 后再操作。")
         sys.exit(1)
+    _check_archived_write_block(batch, "手工关联")
 
     bank_txn = None
     for t in batch.bank_txns:
@@ -1147,7 +1257,7 @@ def manual_link(batch_id: str, bank_txn_id: str, system_txn_id: str,
 @click.option("--batch-id", "-b", required=True, help="批次ID")
 def undo(batch_id: str) -> None:
     storage = _get_storage()
-    if not storage.batch_exists(batch_id):
+    if not storage.batch_exists_anywhere(batch_id):
         console.print(f"[red]ERR[/] 批次不存在: {batch_id}")
         sys.exit(1)
 
@@ -1156,6 +1266,7 @@ def undo(batch_id: str) -> None:
     if batch.is_closed:
         console.print(f"[red]ERR[/] 批次已关闭（closed），禁止操作。请先 reopen 后再操作。")
         sys.exit(1)
+    _check_archived_write_block(batch, "撤销手工关联")
 
     if not batch.manual_link_history:
         console.print("[yellow]没有可撤销的手工关联操作[/]")
@@ -1242,6 +1353,141 @@ def undo(batch_id: str) -> None:
     console.print(f"  操作时间: {last_entry['timestamp']}")
 
 
+# ── batch group (archive/restore/cleanup) ─────────────────
+@cli.group("batch", help="批次归档/恢复/清理管理")
+def batch_group() -> None:
+    pass
+
+
+@batch_group.command("archive", help="归档批次（移到 archive 目录，禁写仅读）")
+@click.argument("batch_id")
+@click.option("--operator", "-o", default="", help="操作人（会写入审计）")
+@click.option("--note", "-n", default="", help="备注（会写入审计）")
+def batch_archive(batch_id: str, operator: str, note: str) -> None:
+    storage = _get_storage()
+    if not storage.batch_exists_anywhere(batch_id):
+        console.print(f"[red]ERR[/] 批次不存在: {batch_id}")
+        sys.exit(1)
+
+    if storage.batch_is_archived(batch_id):
+        batch = storage.load(batch_id)
+        console.print(f"[yellow]WARN[/] 批次已处于归档状态: [bold]{batch.name}[/] ({batch_id})")
+        return
+
+    try:
+        batch = storage.archive_batch(batch_id)
+    except FileNotFoundError as e:
+        console.print(f"[red]ERR[/] {e}")
+        sys.exit(1)
+
+    audit = _get_audit(storage)
+    audit.log_archive("archive", batch_id, batch.name, operator, note)
+    audit.log("archive", batch_id, 0,
+              f"归档批次 {batch.name}" + (f", 操作人: {operator}" if operator else "")
+              + (f", 备注: {note}" if note else ""))
+    _maybe_cleanup_audit(audit, storage)
+
+    console.print(f"[green]OK[/] 批次已归档: [bold]{batch.name}[/] ({batch_id})")
+    console.print(f"  位置: {storage.archive_dir}")
+    console.print(f"  状态: archived（禁写，仅读）")
+    console.print(f"  [dim]恢复请执行: bank-reconcile batch restore {batch_id}[/]")
+
+
+@batch_group.command("restore", help="从归档恢复批次（移回正常目录，恢复为 closed）")
+@click.argument("batch_id")
+@click.option("--operator", "-o", default="", help="操作人（会写入审计）")
+@click.option("--note", "-n", default="", help="备注（会写入审计）")
+def batch_restore(batch_id: str, operator: str, note: str) -> None:
+    storage = _get_storage()
+    if not storage.batch_exists_anywhere(batch_id):
+        console.print(f"[red]ERR[/] 批次不存在: {batch_id}")
+        sys.exit(1)
+
+    if not storage.batch_is_archived(batch_id):
+        batch = storage.load(batch_id)
+        console.print(f"[yellow]WARN[/] 批次不在归档目录: [bold]{batch.name}[/] ({batch_id}), 当前状态: {batch.status.value}")
+        return
+
+    try:
+        batch = storage.restore_batch(batch_id)
+    except FileNotFoundError as e:
+        console.print(f"[red]ERR[/] {e}")
+        sys.exit(1)
+
+    audit = _get_audit(storage)
+    audit.log_archive("restore", batch_id, batch.name, operator, note)
+    audit.log("restore", batch_id, 0,
+              f"恢复归档批次 {batch.name}（状态 {batch.status.value}）"
+              + (f", 操作人: {operator}" if operator else "")
+              + (f", 备注: {note}" if note else ""))
+    _maybe_cleanup_audit(audit, storage)
+
+    console.print(f"[green]OK[/] 批次已从归档恢复: [bold]{batch.name}[/] ({batch_id})")
+    console.print(f"  当前状态: {batch.status.value}（如需导入/匹配，请再执行 reopen）")
+    if batch.status.value == "closed":
+        console.print(f"  [dim]重新打开: bank-reconcile reopen -b {batch_id}[/]")
+
+
+@batch_group.command("cleanup", help="清理超期归档批次（读 config.yaml 的 retention_days，默认 365 天）")
+@click.option("--force", is_flag=True, help="真正删除（默认只预览不删除）")
+def batch_cleanup(force: bool) -> None:
+    storage = _get_storage()
+    cfg = load_config(storage.storage_dir)
+    retention_days = cfg.get("retention_days", 365)
+
+    if force:
+        expired = storage.cleanup_archives(retention_days, force=True)
+        if not expired:
+            console.print(f"[green]OK[/] 无超期归档批次（保留期 {retention_days} 天）")
+            return
+
+        table = Table(title=f"已删除超期归档批次（保留期 {retention_days} 天）")
+        table.add_column("批次ID", style="cyan")
+        table.add_column("名称", style="bold")
+        table.add_column("归档/更新时间", style="dim")
+        table.add_column("大小", justify="right", style="dim")
+
+        total_size = 0
+        for item in expired:
+            size_kb = item["size_bytes"] / 1024
+            total_size += item["size_bytes"]
+            ts = (item["archived_at"] or "")[:19].replace("T", " ")
+            table.add_row(
+                item["batch_id"],
+                item["name"],
+                ts,
+                f"{size_kb:.1f} KB",
+            )
+        console.print(table)
+        console.print(f"[green]OK[/] 共删除 {len(expired)} 个超期批次，释放 {total_size/1024:.1f} KB")
+    else:
+        expired = storage.cleanup_archives(retention_days, force=False)
+        if not expired:
+            console.print(f"[green]OK[/] 无超期归档批次（保留期 {retention_days} 天）")
+            return
+
+        table = Table(title=f"预览: 超期归档批次（保留期 {retention_days} 天，加 --force 才真正删除）")
+        table.add_column("批次ID", style="cyan")
+        table.add_column("名称", style="bold")
+        table.add_column("归档/更新时间", style="dim")
+        table.add_column("大小", justify="right", style="dim")
+
+        total_size = 0
+        for item in expired:
+            size_kb = item["size_bytes"] / 1024
+            total_size += item["size_bytes"]
+            ts = (item["archived_at"] or "")[:19].replace("T", " ")
+            table.add_row(
+                item["batch_id"],
+                item["name"],
+                ts,
+                f"{size_kb:.1f} KB",
+            )
+        console.print(table)
+        console.print(f"[yellow]预览模式[/]: 共 {len(expired)} 个超期批次，预计释放 {total_size/1024:.1f} KB")
+        console.print(f"  [dim]加 --force 真正删除: bank-reconcile batch cleanup --force[/]")
+
+
 def main() -> None:
     cli()
 
@@ -1307,7 +1553,8 @@ def config_show() -> None:
 
     console.print(Panel.fit(
         f"[bold]存储目录:[/] {storage.storage_dir}\n"
-        f"[bold]审计保留天数:[/] {cfg.get('audit_retention_days', 90)}",
+        f"[bold]审计保留天数:[/] {cfg.get('audit_retention_days', 90)}\n"
+        f"[bold]归档保留天数:[/] {cfg.get('retention_days', 365)}",
         title="全局配置",
     ))
 
