@@ -1,0 +1,843 @@
+{
+  "batch_id": "BATCH-ECC94E03",
+  "name": "2024年1月对账",
+  "created_at": "2026-06-14T11:47:05.015557",
+  "updated_at": "2026-06-14T11:49:24.359326",
+  "rule_file": "D:\\workSpace\\AI__SPACE\\zzz-00049\\samples\\rules.yaml",
+  "imported_files": [
+    {
+      "file_type": "bank_statement",
+      "file_path": "D:\\workSpace\\AI__SPACE\\zzz-00049\\samples\\bank_statement.csv",
+      "imported_at": "2026-06-14T11:47:08.908092",
+      "row_count": 10,
+      "error_count": 2
+    },
+    {
+      "file_type": "system_receipt",
+      "file_path": "D:\\workSpace\\AI__SPACE\\zzz-00049\\samples\\system_receipt.csv",
+      "imported_at": "2026-06-14T11:48:08.110690",
+      "row_count": 11,
+      "error_count": 0
+    },
+    {
+      "file_type": "manual_adjustment",
+      "file_path": "D:\\workSpace\\AI__SPACE\\zzz-00049\\samples\\manual_adjustment.csv",
+      "imported_at": "2026-06-14T11:48:20.904647",
+      "row_count": 2,
+      "error_count": 0
+    }
+  ],
+  "bank_txns": [
+    {
+      "txn_id": "B001",
+      "amount": 1500.0,
+      "date": "2024-01-02",
+      "file_type": "bank_statement",
+      "source_file": "samples/bank_statement.csv",
+      "source_row": 2,
+      "counterparty": "甲公司",
+      "description": "货款",
+      "currency": "CNY",
+      "raw_data": {
+        "交易流水号": "B001",
+        "交易日期": "2024-01-02",
+        "金额": "1500.00",
+        "对方户名": "甲公司",
+        "摘要": "货款",
+        "币种": "CNY"
+      }
+    },
+    {
+      "txn_id": "B002",
+      "amount": 3200.5,
+      "date": "2024-01-03",
+      "file_type": "bank_statement",
+      "source_file": "samples/bank_statement.csv",
+      "source_row": 3,
+      "counterparty": "乙公司",
+      "description": "服务费",
+      "currency": "CNY",
+      "raw_data": {
+        "交易流水号": "B002",
+        "交易日期": "2024-01-03",
+        "金额": "3200.50",
+        "对方户名": "乙公司",
+        "摘要": "服务费",
+        "币种": "CNY"
+      }
+    },
+    {
+      "txn_id": "B003",
+      "amount": 2500.0,
+      "date": "2024-01-05",
+      "file_type": "bank_statement",
+      "source_file": "samples/bank_statement.csv",
+      "source_row": 4,
+      "counterparty": "丙公司",
+      "description": "货款",
+      "currency": "CNY",
+      "raw_data": {
+        "交易流水号": "B003",
+        "交易日期": "2024-01-05",
+        "金额": "2,500.00",
+        "对方户名": "丙公司",
+        "摘要": "货款",
+        "币种": "CNY"
+      }
+    },
+    {
+      "txn_id": "B004",
+      "amount": 890.0,
+      "date": "2024-01-06",
+      "file_type": "bank_statement",
+      "source_file": "samples/bank_statement.csv",
+      "source_row": 5,
+      "counterparty": "丁公司",
+      "description": "手续费",
+      "currency": "CNY",
+      "raw_data": {
+        "交易流水号": "B004",
+        "交易日期": "2024-01-06",
+        "金额": "890.00",
+        "对方户名": "丁公司",
+        "摘要": "手续费",
+        "币种": "CNY"
+      }
+    },
+    {
+      "txn_id": "B005",
+      "amount": 5600.0,
+      "date": "2024-01-08",
+      "file_type": "bank_statement",
+      "source_file": "samples/bank_statement.csv",
+      "source_row": 6,
+      "counterparty": "戊公司",
+      "description": "货款",
+      "currency": "CNY",
+      "raw_data": {
+        "交易流水号": "B005",
+        "交易日期": "2024-01-08",
+        "金额": "5600.00",
+        "对方户名": "戊公司",
+        "摘要": "货款",
+        "币种": "CNY"
+      }
+    },
+    {
+      "txn_id": "B006",
+      "amount": 1200.0,
+      "date": "2024-01-10",
+      "file_type": "bank_statement",
+      "source_file": "samples/bank_statement.csv",
+      "source_row": 7,
+      "counterparty": "己公司",
+      "description": "待确认收入",
+      "currency": "CNY",
+      "raw_data": {
+        "交易流水号": "B006",
+        "交易日期": "2024-01-10",
+        "金额": "1200.00",
+        "对方户名": "己公司",
+        "摘要": "待确认收入",
+        "币种": "CNY"
+      }
+    },
+    {
+      "txn_id": "B007",
+      "amount": 750.0,
+      "date": "2024-01-12",
+      "file_type": "bank_statement",
+      "source_file": "samples/bank_statement.csv",
+      "source_row": 8,
+      "counterparty": "庚公司",
+      "description": "利息收入",
+      "currency": "CNY",
+      "raw_data": {
+        "交易流水号": "B007",
+        "交易日期": "2024-01-12",
+        "金额": "750.00",
+        "对方户名": "庚公司",
+        "摘要": "利息收入",
+        "币种": "CNY"
+      }
+    },
+    {
+      "txn_id": "B008",
+      "amount": 3300.0,
+      "date": "2024-01-15",
+      "file_type": "bank_statement",
+      "source_file": "samples/bank_statement.csv",
+      "source_row": 9,
+      "counterparty": "辛公司",
+      "description": "退款",
+      "currency": "CNY",
+      "raw_data": {
+        "交易流水号": "B008",
+        "交易日期": "2024-01-15",
+        "金额": "3300.00",
+        "对方户名": "辛公司",
+        "摘要": "退款",
+        "币种": "CNY"
+      }
+    },
+    {
+      "txn_id": "B002",
+      "amount": 3200.5,
+      "date": "2024-01-16",
+      "file_type": "bank_statement",
+      "source_file": "samples/bank_statement.csv",
+      "source_row": 10,
+      "counterparty": "乙公司",
+      "description": "服务费重复",
+      "currency": "CNY",
+      "raw_data": {
+        "交易流水号": "B002",
+        "交易日期": "2024-01-16",
+        "金额": "3200.50",
+        "对方户名": "乙公司",
+        "摘要": "服务费重复",
+        "币种": "CNY"
+      }
+    },
+    {
+      "txn_id": "B011",
+      "amount": 2100.0,
+      "date": "2024-01-20",
+      "file_type": "bank_statement",
+      "source_file": "samples/bank_statement.csv",
+      "source_row": 13,
+      "counterparty": "癸公司",
+      "description": "调账",
+      "currency": "CNY",
+      "raw_data": {
+        "交易流水号": "B011",
+        "交易日期": "2024-01-20",
+        "金额": "2100.00",
+        "对方户名": "癸公司",
+        "摘要": "调账",
+        "币种": "CNY"
+      }
+    }
+  ],
+  "system_txns": [
+    {
+      "txn_id": "B001",
+      "amount": 1500.0,
+      "date": "2024-01-02",
+      "file_type": "system_receipt",
+      "source_file": "samples/system_receipt.csv",
+      "source_row": 2,
+      "counterparty": "甲公司",
+      "description": "订单收款",
+      "currency": "CNY",
+      "raw_data": {
+        "订单号": "B001",
+        "收款日期": "2024-01-02",
+        "收款金额": "1500.00",
+        "客户": "甲公司",
+        "备注": "订单收款",
+        "币种": "CNY"
+      }
+    },
+    {
+      "txn_id": "B002",
+      "amount": 3200.5,
+      "date": "2024-01-03",
+      "file_type": "system_receipt",
+      "source_file": "samples/system_receipt.csv",
+      "source_row": 3,
+      "counterparty": "乙公司",
+      "description": "服务费收款",
+      "currency": "CNY",
+      "raw_data": {
+        "订单号": "B002",
+        "收款日期": "2024-01-03",
+        "收款金额": "3200.50",
+        "客户": "乙公司",
+        "备注": "服务费收款",
+        "币种": "CNY"
+      }
+    },
+    {
+      "txn_id": "B003",
+      "amount": 2500.0,
+      "date": "2024-01-05",
+      "file_type": "system_receipt",
+      "source_file": "samples/system_receipt.csv",
+      "source_row": 4,
+      "counterparty": "丙公司",
+      "description": "订单收款",
+      "currency": "CNY",
+      "raw_data": {
+        "订单号": "B003",
+        "收款日期": "2024-01-05",
+        "收款金额": "2500.00",
+        "客户": "丙公司",
+        "备注": "订单收款",
+        "币种": "CNY"
+      }
+    },
+    {
+      "txn_id": "B005",
+      "amount": 5600.0,
+      "date": "2024-01-08",
+      "file_type": "system_receipt",
+      "source_file": "samples/system_receipt.csv",
+      "source_row": 5,
+      "counterparty": "戊公司",
+      "description": "大客户订单",
+      "currency": "CNY",
+      "raw_data": {
+        "订单号": "B005",
+        "收款日期": "2024-01-08",
+        "收款金额": "5600.00",
+        "客户": "戊公司",
+        "备注": "大客户订单",
+        "币种": "CNY"
+      }
+    },
+    {
+      "txn_id": "B006",
+      "amount": 1200.0,
+      "date": "2024-01-10",
+      "file_type": "system_receipt",
+      "source_file": "samples/system_receipt.csv",
+      "source_row": 6,
+      "counterparty": "己公司",
+      "description": "待确认",
+      "currency": "CNY",
+      "raw_data": {
+        "订单号": "B006",
+        "收款日期": "2024-01-10",
+        "收款金额": "1200.00",
+        "客户": "己公司",
+        "备注": "待确认",
+        "币种": "CNY"
+      }
+    },
+    {
+      "txn_id": "B009",
+      "amount": 4300.0,
+      "date": "2024-01-14",
+      "file_type": "system_receipt",
+      "source_file": "samples/system_receipt.csv",
+      "source_row": 7,
+      "counterparty": "寅公司",
+      "description": "新增订单",
+      "currency": "CNY",
+      "raw_data": {
+        "订单号": "B009",
+        "收款日期": "2024-01-14",
+        "收款金额": "4300.00",
+        "客户": "寅公司",
+        "备注": "新增订单",
+        "币种": "CNY"
+      }
+    },
+    {
+      "txn_id": "B010",
+      "amount": 1800.0,
+      "date": "2024-01-18",
+      "file_type": "system_receipt",
+      "source_file": "samples/system_receipt.csv",
+      "source_row": 8,
+      "counterparty": "壬公司",
+      "description": "订单收款",
+      "currency": "CNY",
+      "raw_data": {
+        "订单号": "B010",
+        "收款日期": "2024-01-18",
+        "收款金额": "1800.00",
+        "客户": "壬公司",
+        "备注": "订单收款",
+        "币种": "CNY"
+      }
+    },
+    {
+      "txn_id": "B004",
+      "amount": 900.0,
+      "date": "2024-01-06",
+      "file_type": "system_receipt",
+      "source_file": "samples/system_receipt.csv",
+      "source_row": 9,
+      "counterparty": "丁公司",
+      "description": "手续费",
+      "currency": "CNY",
+      "raw_data": {
+        "订单号": "B004",
+        "收款日期": "2024-01-06",
+        "收款金额": "900.00",
+        "客户": "丁公司",
+        "备注": "手续费",
+        "币种": "CNY"
+      }
+    },
+    {
+      "txn_id": "B008",
+      "amount": 3300.0,
+      "date": "2024-01-15",
+      "file_type": "system_receipt",
+      "source_file": "samples/system_receipt.csv",
+      "source_row": 10,
+      "counterparty": "辛公司",
+      "description": "退款处理",
+      "currency": "CNY",
+      "raw_data": {
+        "订单号": "B008",
+        "收款日期": "2024-01-15",
+        "收款金额": "3300.00",
+        "客户": "辛公司",
+        "备注": "退款处理",
+        "币种": "CNY"
+      }
+    },
+    {
+      "txn_id": "B011",
+      "amount": 2100.0,
+      "date": "2024-01-20",
+      "file_type": "system_receipt",
+      "source_file": "samples/system_receipt.csv",
+      "source_row": 11,
+      "counterparty": "癸公司",
+      "description": "调账",
+      "currency": "CNY",
+      "raw_data": {
+        "订单号": "B011",
+        "收款日期": "2024-01-20",
+        "收款金额": "2100.00",
+        "客户": "癸公司",
+        "备注": "调账",
+        "币种": "CNY"
+      }
+    },
+    {
+      "txn_id": "B012",
+      "amount": 6700.0,
+      "date": "2024-01-22",
+      "file_type": "system_receipt",
+      "source_file": "samples/system_receipt.csv",
+      "source_row": 12,
+      "counterparty": "卯公司",
+      "description": "大额订单",
+      "currency": "CNY",
+      "raw_data": {
+        "订单号": "B012",
+        "收款日期": "2024-01-22",
+        "收款金额": "6700.00",
+        "客户": "卯公司",
+        "备注": "大额订单",
+        "币种": "CNY"
+      }
+    }
+  ],
+  "adjustment_txns": [
+    {
+      "txn_id": "B004",
+      "amount": 10.0,
+      "date": "2024-01-06",
+      "file_type": "manual_adjustment",
+      "source_file": "samples/manual_adjustment.csv",
+      "source_row": 2,
+      "counterparty": "丁公司",
+      "description": "手续费差额调账",
+      "currency": "CNY",
+      "raw_data": {
+        "调整编号": "B004",
+        "调整日期": "2024-01-06",
+        "调整金额": "10.00",
+        "对方": "丁公司",
+        "调整原因": "手续费差额调账",
+        "币种": "CNY"
+      }
+    },
+    {
+      "txn_id": "B011",
+      "amount": 200.0,
+      "date": "2024-01-20",
+      "file_type": "manual_adjustment",
+      "source_file": "samples/manual_adjustment.csv",
+      "source_row": 3,
+      "counterparty": "癸公司",
+      "description": "调账金额补充",
+      "currency": "CNY",
+      "raw_data": {
+        "调整编号": "B011",
+        "调整日期": "2024-01-20",
+        "调整金额": "200.00",
+        "对方": "癸公司",
+        "调整原因": "调账金额补充",
+        "币种": "CNY"
+      }
+    }
+  ],
+  "discrepancies": [
+    {
+      "discrepancy_id": "DISP-D166C5FBFD",
+      "discrepancy_type": "duplicate",
+      "status": "open",
+      "message": "银行回单中存在重复流水号 B002, 首笔金额 3200.5, 本笔金额 3200.5, 首笔行号 3, 本笔行号 10",
+      "reviewer": null,
+      "note": "",
+      "rollback_history": [],
+      "created_at": "2026-06-14T11:48:40.228420",
+      "updated_at": "2026-06-14T11:49:13.351452",
+      "bank_txn": {
+        "txn_id": "B002",
+        "amount": 3200.5,
+        "date": "2024-01-16",
+        "file_type": "bank_statement",
+        "source_file": "samples/bank_statement.csv",
+        "source_row": 10,
+        "counterparty": "乙公司",
+        "description": "服务费重复",
+        "currency": "CNY",
+        "raw_data": {
+          "交易流水号": "B002",
+          "交易日期": "2024-01-16",
+          "金额": "3200.50",
+          "对方户名": "乙公司",
+          "摘要": "服务费重复",
+          "币种": "CNY"
+        }
+      },
+      "system_txn": null,
+      "adjustment_txn": null
+    },
+    {
+      "discrepancy_id": "DISP-83B070F816",
+      "discrepancy_type": "needs_manual_review",
+      "status": "open",
+      "message": "摘要包含待人工确认关键词，银行: '手续费' / 系统: '手续费'",
+      "reviewer": null,
+      "note": "",
+      "rollback_history": [],
+      "created_at": "2026-06-14T11:48:40.228420",
+      "updated_at": "2026-06-14T11:48:40.228420",
+      "bank_txn": {
+        "txn_id": "B004",
+        "amount": 890.0,
+        "date": "2024-01-06",
+        "file_type": "bank_statement",
+        "source_file": "samples/bank_statement.csv",
+        "source_row": 5,
+        "counterparty": "丁公司",
+        "description": "手续费",
+        "currency": "CNY",
+        "raw_data": {
+          "交易流水号": "B004",
+          "交易日期": "2024-01-06",
+          "金额": "890.00",
+          "对方户名": "丁公司",
+          "摘要": "手续费",
+          "币种": "CNY"
+        }
+      },
+      "system_txn": {
+        "txn_id": "B004",
+        "amount": 900.0,
+        "date": "2024-01-06",
+        "file_type": "system_receipt",
+        "source_file": "samples/system_receipt.csv",
+        "source_row": 9,
+        "counterparty": "丁公司",
+        "description": "手续费",
+        "currency": "CNY",
+        "raw_data": {
+          "订单号": "B004",
+          "收款日期": "2024-01-06",
+          "收款金额": "900.00",
+          "客户": "丁公司",
+          "备注": "手续费",
+          "币种": "CNY"
+        }
+      },
+      "adjustment_txn": null
+    },
+    {
+      "discrepancy_id": "DISP-0889CFD8C0",
+      "discrepancy_type": "needs_manual_review",
+      "status": "open",
+      "message": "摘要包含待人工确认关键词，银行: '待确认收入' / 系统: '待确认'",
+      "reviewer": null,
+      "note": "",
+      "rollback_history": [],
+      "created_at": "2026-06-14T11:48:40.228420",
+      "updated_at": "2026-06-14T11:48:40.228420",
+      "bank_txn": {
+        "txn_id": "B006",
+        "amount": 1200.0,
+        "date": "2024-01-10",
+        "file_type": "bank_statement",
+        "source_file": "samples/bank_statement.csv",
+        "source_row": 7,
+        "counterparty": "己公司",
+        "description": "待确认收入",
+        "currency": "CNY",
+        "raw_data": {
+          "交易流水号": "B006",
+          "交易日期": "2024-01-10",
+          "金额": "1200.00",
+          "对方户名": "己公司",
+          "摘要": "待确认收入",
+          "币种": "CNY"
+        }
+      },
+      "system_txn": {
+        "txn_id": "B006",
+        "amount": 1200.0,
+        "date": "2024-01-10",
+        "file_type": "system_receipt",
+        "source_file": "samples/system_receipt.csv",
+        "source_row": 6,
+        "counterparty": "己公司",
+        "description": "待确认",
+        "currency": "CNY",
+        "raw_data": {
+          "订单号": "B006",
+          "收款日期": "2024-01-10",
+          "收款金额": "1200.00",
+          "客户": "己公司",
+          "备注": "待确认",
+          "币种": "CNY"
+        }
+      },
+      "adjustment_txn": null
+    },
+    {
+      "discrepancy_id": "DISP-361DA1C1E5",
+      "discrepancy_type": "missing_in_system",
+      "status": "open",
+      "message": "银行有此流水 B007 (金额 750.0)，但系统无记录",
+      "reviewer": null,
+      "note": "",
+      "rollback_history": [],
+      "created_at": "2026-06-14T11:48:40.228420",
+      "updated_at": "2026-06-14T11:48:40.228420",
+      "bank_txn": {
+        "txn_id": "B007",
+        "amount": 750.0,
+        "date": "2024-01-12",
+        "file_type": "bank_statement",
+        "source_file": "samples/bank_statement.csv",
+        "source_row": 8,
+        "counterparty": "庚公司",
+        "description": "利息收入",
+        "currency": "CNY",
+        "raw_data": {
+          "交易流水号": "B007",
+          "交易日期": "2024-01-12",
+          "金额": "750.00",
+          "对方户名": "庚公司",
+          "摘要": "利息收入",
+          "币种": "CNY"
+        }
+      },
+      "system_txn": null,
+      "adjustment_txn": null
+    },
+    {
+      "discrepancy_id": "DISP-836474855B",
+      "discrepancy_type": "needs_manual_review",
+      "status": "open",
+      "message": "摘要包含待人工确认关键词，银行: '退款' / 系统: '退款处理'",
+      "reviewer": null,
+      "note": "",
+      "rollback_history": [],
+      "created_at": "2026-06-14T11:48:40.228420",
+      "updated_at": "2026-06-14T11:48:40.228420",
+      "bank_txn": {
+        "txn_id": "B008",
+        "amount": 3300.0,
+        "date": "2024-01-15",
+        "file_type": "bank_statement",
+        "source_file": "samples/bank_statement.csv",
+        "source_row": 9,
+        "counterparty": "辛公司",
+        "description": "退款",
+        "currency": "CNY",
+        "raw_data": {
+          "交易流水号": "B008",
+          "交易日期": "2024-01-15",
+          "金额": "3300.00",
+          "对方户名": "辛公司",
+          "摘要": "退款",
+          "币种": "CNY"
+        }
+      },
+      "system_txn": {
+        "txn_id": "B008",
+        "amount": 3300.0,
+        "date": "2024-01-15",
+        "file_type": "system_receipt",
+        "source_file": "samples/system_receipt.csv",
+        "source_row": 10,
+        "counterparty": "辛公司",
+        "description": "退款处理",
+        "currency": "CNY",
+        "raw_data": {
+          "订单号": "B008",
+          "收款日期": "2024-01-15",
+          "收款金额": "3300.00",
+          "客户": "辛公司",
+          "备注": "退款处理",
+          "币种": "CNY"
+        }
+      },
+      "adjustment_txn": null
+    },
+    {
+      "discrepancy_id": "DISP-B6E3ADCC6B",
+      "discrepancy_type": "needs_manual_review",
+      "status": "open",
+      "message": "摘要包含待人工确认关键词，银行: '调账' / 系统: '调账'",
+      "reviewer": null,
+      "note": "",
+      "rollback_history": [],
+      "created_at": "2026-06-14T11:48:40.228420",
+      "updated_at": "2026-06-14T11:48:40.228420",
+      "bank_txn": {
+        "txn_id": "B011",
+        "amount": 2100.0,
+        "date": "2024-01-20",
+        "file_type": "bank_statement",
+        "source_file": "samples/bank_statement.csv",
+        "source_row": 13,
+        "counterparty": "癸公司",
+        "description": "调账",
+        "currency": "CNY",
+        "raw_data": {
+          "交易流水号": "B011",
+          "交易日期": "2024-01-20",
+          "金额": "2100.00",
+          "对方户名": "癸公司",
+          "摘要": "调账",
+          "币种": "CNY"
+        }
+      },
+      "system_txn": {
+        "txn_id": "B011",
+        "amount": 2100.0,
+        "date": "2024-01-20",
+        "file_type": "system_receipt",
+        "source_file": "samples/system_receipt.csv",
+        "source_row": 11,
+        "counterparty": "癸公司",
+        "description": "调账",
+        "currency": "CNY",
+        "raw_data": {
+          "订单号": "B011",
+          "收款日期": "2024-01-20",
+          "收款金额": "2100.00",
+          "客户": "癸公司",
+          "备注": "调账",
+          "币种": "CNY"
+        }
+      },
+      "adjustment_txn": null
+    },
+    {
+      "discrepancy_id": "DISP-A81FB8BC1F",
+      "discrepancy_type": "missing_in_bank",
+      "status": "open",
+      "message": "系统有此流水 B009 (金额 4300.0)，但银行无记录",
+      "reviewer": null,
+      "note": "",
+      "rollback_history": [],
+      "created_at": "2026-06-14T11:48:40.228420",
+      "updated_at": "2026-06-14T11:48:40.228420",
+      "bank_txn": null,
+      "system_txn": {
+        "txn_id": "B009",
+        "amount": 4300.0,
+        "date": "2024-01-14",
+        "file_type": "system_receipt",
+        "source_file": "samples/system_receipt.csv",
+        "source_row": 7,
+        "counterparty": "寅公司",
+        "description": "新增订单",
+        "currency": "CNY",
+        "raw_data": {
+          "订单号": "B009",
+          "收款日期": "2024-01-14",
+          "收款金额": "4300.00",
+          "客户": "寅公司",
+          "备注": "新增订单",
+          "币种": "CNY"
+        }
+      },
+      "adjustment_txn": null
+    },
+    {
+      "discrepancy_id": "DISP-1AA6FE760E",
+      "discrepancy_type": "missing_in_bank",
+      "status": "open",
+      "message": "系统有此流水 B010 (金额 1800.0)，但银行无记录",
+      "reviewer": null,
+      "note": "",
+      "rollback_history": [],
+      "created_at": "2026-06-14T11:48:40.228420",
+      "updated_at": "2026-06-14T11:48:40.228420",
+      "bank_txn": null,
+      "system_txn": {
+        "txn_id": "B010",
+        "amount": 1800.0,
+        "date": "2024-01-18",
+        "file_type": "system_receipt",
+        "source_file": "samples/system_receipt.csv",
+        "source_row": 8,
+        "counterparty": "壬公司",
+        "description": "订单收款",
+        "currency": "CNY",
+        "raw_data": {
+          "订单号": "B010",
+          "收款日期": "2024-01-18",
+          "收款金额": "1800.00",
+          "客户": "壬公司",
+          "备注": "订单收款",
+          "币种": "CNY"
+        }
+      },
+      "adjustment_txn": null
+    },
+    {
+      "discrepancy_id": "DISP-FED92E38D3",
+      "discrepancy_type": "missing_in_bank",
+      "status": "open",
+      "message": "系统有此流水 B012 (金额 6700.0)，但银行无记录",
+      "reviewer": null,
+      "note": "",
+      "rollback_history": [],
+      "created_at": "2026-06-14T11:48:40.228420",
+      "updated_at": "2026-06-14T11:48:40.228420",
+      "bank_txn": null,
+      "system_txn": {
+        "txn_id": "B012",
+        "amount": 6700.0,
+        "date": "2024-01-22",
+        "file_type": "system_receipt",
+        "source_file": "samples/system_receipt.csv",
+        "source_row": 12,
+        "counterparty": "卯公司",
+        "description": "大额订单",
+        "currency": "CNY",
+        "raw_data": {
+          "订单号": "B012",
+          "收款日期": "2024-01-22",
+          "收款金额": "6700.00",
+          "客户": "卯公司",
+          "备注": "大额订单",
+          "币种": "CNY"
+        }
+      },
+      "adjustment_txn": null
+    }
+  ],
+  "exports": [
+    {
+      "export_type": "discrepancies",
+      "file_path": "D:\\workSpace\\AI__SPACE\\zzz-00049\\report\\test_export.csv",
+      "exported_at": "2026-06-14T11:49:24.359326",
+      "discrepancy_count": 9
+    }
+  ]
+}

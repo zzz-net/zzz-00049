@@ -1,0 +1,10 @@
+Metadata-Version: 2.4
+Name: bank-reconcile
+Version: 0.1.0
+Summary: 银行回单对账 CLI - 解析、匹配、状态存储、报告
+Author: Bank Reconcile Team
+Requires-Python: >=3.9
+Requires-Dist: click>=8.1.0
+Requires-Dist: pyyaml>=6.0
+Requires-Dist: pandas>=2.0.0
+Requires-Dist: rich>=13.0.0

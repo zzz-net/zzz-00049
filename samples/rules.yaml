@@ -1,0 +1,13 @@
+amount_tolerance: 0.01
+date_window_days: 3
+require_exact_txn_id: true
+case_sensitive_txn_id: false
+manual_review_keywords:
+  - 调账
+  - 手续费
+  - 利息
+  - 退款
+  - 红冲
+  - 待确认
+ignore_duplicate_if_amount_differs: false
+consider_adjustments: true

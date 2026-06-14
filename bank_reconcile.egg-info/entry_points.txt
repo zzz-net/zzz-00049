@@ -1,0 +1,2 @@
+[console_scripts]
+bank-reconcile = bank_reconcile.cli:cli

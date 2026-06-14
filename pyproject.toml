@@ -1,0 +1,23 @@
+[project]
+name = "bank-reconcile"
+version = "0.1.0"
+description = "银行回单对账 CLI - 解析、匹配、状态存储、报告"
+requires-python = ">=3.9"
+authors = [{ name = "Bank Reconcile Team" }]
+dependencies = [
+    "click>=8.1.0",
+    "pyyaml>=6.0",
+    "pandas>=2.0.0",
+    "rich>=13.0.0",
+]
+
+[project.scripts]
+bank-reconcile = "bank_reconcile.cli:cli"
+
+[build-system]
+requires = ["setuptools>=64", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["bank_reconcile*"]
