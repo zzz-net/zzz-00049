@@ -36,6 +36,17 @@ from .config import (
     STANDARD_FIELDS,
     FILE_TYPE_ALIAS_KEYS,
 )
+from .snapshot import (
+    create_snapshot,
+    read_snapshot_info,
+    restore_snapshot,
+    ConflictStrategy,
+    SnapshotError,
+    SnapshotCorruptedError,
+    SnapshotVersionError,
+    SnapshotConflictError,
+    SNAPSHOT_FILE_EXT,
+)
 
 
 console = Console(highlight=False, emoji=False, markup=True)
@@ -878,7 +889,7 @@ def reopen(batch_id: str) -> None:
 @click.option("--from", "from_date", default=None, help="起始日期 (YYYY-MM-DD)")
 @click.option("--to", "to_date", default=None, help="截止日期 (YYYY-MM-DD)")
 @click.option("--type", "-t", "op_type", default=None,
-              type=click.Choice(["import", "match", "mark", "rollback", "close", "reopen", "manual_link", "undo_manual_link", "tolerance_match", "schedule_add", "schedule_update", "schedule_delete", "schedule_run", "schedule_load"]),
+              type=click.Choice(["import", "match", "mark", "rollback", "close", "reopen", "manual_link", "undo_manual_link", "tolerance_match", "schedule_add", "schedule_update", "schedule_delete", "schedule_run", "schedule_load", "snapshot_create", "snapshot_create_fail", "snapshot_restore", "snapshot_restore_fail"]),
               help="按操作类型过滤")
 @click.option("--batch", "-b", "batch_id", default=None, help="按批次ID过滤")
 @click.option("--output", "-o", default=None, help="导出文件路径（需配合 --format）")
@@ -1965,6 +1976,228 @@ def schedule_run(task_id: str, now: bool) -> None:
         for step_name, sr in result.get("steps", {}).items():
             console.print(f"  {step_name}: {sr}")
         sys.exit(1)
+
+
+# ── snapshot group ────────────────────────────────────────
+@cli.group("snapshot", help="批次快照与恢复（可迁移打包）: create / info / restore")
+def snapshot_group() -> None:
+    pass
+
+
+@snapshot_group.command("create", help="创建批次快照：打包数据、规则、审计、配置为可迁移文件")
+@click.option("--batch-id", "-b", required=True, help="批次ID")
+@click.option("--output", "-o", "output_path", default=None,
+              help=f"输出文件路径（默认: 当前目录/<批次ID>_<名称>{SNAPSHOT_FILE_EXT}）")
+def snapshot_create(batch_id: str, output_path: Optional[str]) -> None:
+    storage = _get_storage()
+    audit = _get_audit(storage)
+
+    if not storage.batch_exists_anywhere(batch_id):
+        err_msg = f"批次不存在: {batch_id}"
+        console.print(f"[red]ERR[/] {err_msg}")
+        audit.log("snapshot_create_fail", batch_id, 0, err_msg)
+        _maybe_cleanup_audit(audit, storage)
+        sys.exit(1)
+
+    try:
+        out_path, info = create_snapshot(batch_id, storage, output_path)
+    except (FileNotFoundError, SnapshotError) as e:
+        err_msg = f"创建快照失败: {e}"
+        console.print(f"[red]ERR[/] {err_msg}")
+        audit.log("snapshot_create_fail", batch_id, 0, err_msg)
+        _maybe_cleanup_audit(audit, storage)
+        sys.exit(1)
+    except Exception as e:
+        err_msg = f"创建快照时发生未知错误: {type(e).__name__}: {e}"
+        console.print(f"[red]ERR[/] {err_msg}")
+        audit.log("snapshot_create_fail", batch_id, 0, err_msg)
+        _maybe_cleanup_audit(audit, storage)
+        sys.exit(1)
+
+    size_kb = info["file_size_bytes"] / 1024
+    summary = (
+        f"创建快照成功: {info['snapshot_id']}, "
+        f"批次 {info['batch_name']}({info['batch_id']}), "
+        f"大小 {size_kb:.1f} KB, 文件 {out_path}"
+    )
+    audit.log(
+        "snapshot_create",
+        batch_id,
+        1,
+        summary,
+    )
+    _maybe_cleanup_audit(audit, storage)
+
+    console.print(Panel.fit(
+        f"[bold green]快照创建成功[/]\n\n"
+        f"[bold cyan]快照ID:[/] {info['snapshot_id']}\n"
+        f"[bold cyan]版本:[/]   {info['snapshot_version']}\n"
+        f"[bold cyan]创建时间:[/] {info['created_at'][:19].replace('T', ' ')}\n"
+        f"[bold cyan]校验摘要:[/] {info['checksum'][:16]}...\n"
+        f"[bold cyan]批次ID:[/]  {info['batch_id']}\n"
+        f"[bold cyan]批次名:[/]  {info['batch_name']}\n"
+        f"[bold cyan]文件大小:[/] {size_kb:.1f} KB\n"
+        f"[bold cyan]输出路径:[/] [bold]{out_path}[/]",
+        title="快照创建结果",
+    ))
+
+
+@snapshot_group.command("info", help="查看快照文件信息（会做完整性校验）")
+@click.argument("snapshot_path")
+def snapshot_info(snapshot_path: str) -> None:
+    try:
+        info = read_snapshot_info(snapshot_path)
+    except FileNotFoundError as e:
+        console.print(f"[red]ERR[/] {e}")
+        sys.exit(1)
+    except SnapshotCorruptedError as e:
+        console.print(f"[red]ERR[/] 快照损坏或校验失败: {e}")
+        sys.exit(1)
+    except SnapshotVersionError as e:
+        console.print(f"[red]ERR[/] 快照版本不兼容: {e}")
+        sys.exit(1)
+    except SnapshotError as e:
+        console.print(f"[red]ERR[/] 读取快照失败: {e}")
+        sys.exit(1)
+    except Exception as e:
+        console.print(f"[red]ERR[/] 未知错误: {type(e).__name__}: {e}")
+        sys.exit(1)
+
+    ps = info.get("payload_summary", {})
+    size_kb = info["file_size_bytes"] / 1024
+
+    table = Table(title=f"快照信息 - {info['snapshot_id']}")
+    table.add_column("字段", style="bold")
+    table.add_column("值")
+
+    table.add_row("快照ID", info["snapshot_id"])
+    table.add_row("快照版本", info["snapshot_version"])
+    table.add_row("创建时间", info["created_at"][:19].replace("T", " "))
+    table.add_row("校验摘要 (SHA-256)", info["checksum"])
+    table.add_row("原批次ID", info["batch_id"])
+    table.add_row("原批次名称", info["batch_name"])
+    table.add_row("原批次状态", info.get("batch_status", "未知"))
+    table.add_row("差异数", str(info.get("discrepancy_count", 0)))
+    table.add_row("银行交易数", str(info.get("bank_txn_count", 0)))
+    table.add_row("系统交易数", str(info.get("system_txn_count", 0)))
+    table.add_row("手工调整数", str(info.get("adjustment_txn_count", 0)))
+    table.add_row("已导入文件数", str(info.get("imported_file_count", 0)))
+    table.add_row("审计记录数", str(info.get("audit_record_count", 0)))
+    table.add_row("文件大小", f"{size_kb:.2f} KB")
+    table.add_row("文件路径", info["file_path"])
+
+    ps_table = Table(title="Payload 概要")
+    ps_table.add_column("字段", style="bold")
+    ps_table.add_column("值")
+
+    ps_table.add_row("内嵌规则", "是" if ps.get("has_rules_yaml") else "否")
+    ps_table.add_row("审计记录", str(ps.get("audit_record_count", 0)))
+    ps_table.add_row("配置键", ", ".join(ps.get("config_keys", [])) or "-")
+    ps_table.add_row("有回滚历史的差异", str(ps.get("rollback_history_discrepancies", 0)))
+    ps_table.add_row("手工关联历史", str(ps.get("manual_link_history_count", 0)))
+    ps_table.add_row("导出历史", str(ps.get("exports_count", 0)))
+    ps_table.add_row("批次创建时间", (ps.get("created_at") or "")[:19].replace("T", " ") or "-")
+    ps_table.add_row("批次更新时间", (ps.get("updated_at") or "")[:19].replace("T", " ") or "-")
+    ps_table.add_row("批次状态", ps.get("status") or "-")
+    ps_table.add_row("原规则文件路径", ps.get("rule_file") or "-")
+
+    console.print(Panel.fit(
+        f"[green]快照完整性校验通过[/]\n",
+        title="校验结果",
+    ))
+    console.print(table)
+    console.print(ps_table)
+
+
+@snapshot_group.command("restore", help="恢复快照到目标存储目录（默认当前工作目录的 .bank_reconcile）")
+@click.argument("snapshot_path")
+@click.option("--target-dir", "-d", default=None,
+              help="目标存储目录（默认: 当前目录/.bank_reconcile 或 $BANK_RECONCILE_HOME）")
+@click.option("--strategy", "-s", default="skip",
+              type=click.Choice(["overwrite", "rename", "skip"]),
+              help="冲突策略: skip（默认，遇冲突报错）/ overwrite（覆盖同ID批次）/ rename（新ID新名称）")
+@click.option("--new-name", default=None, help="配合 --strategy rename 指定新批次名")
+def snapshot_restore(snapshot_path: str, target_dir: Optional[str],
+                     strategy: str, new_name: Optional[str]) -> None:
+    if target_dir:
+        target_storage = BatchStorage(target_dir)
+    else:
+        target_storage = _get_storage()
+
+    target_audit = AuditStorage(target_storage.storage_dir)
+
+    strategy_enum = ConflictStrategy(strategy)
+
+    try:
+        result = restore_snapshot(
+            snapshot_path=snapshot_path,
+            target_storage=target_storage,
+            strategy=strategy_enum,
+            new_name=new_name,
+        )
+    except FileNotFoundError as e:
+        err_msg = f"恢复失败: {e}"
+        console.print(f"[red]ERR[/] {err_msg}")
+        target_audit.log("snapshot_restore_fail", "", 0, err_msg)
+        sys.exit(1)
+    except SnapshotCorruptedError as e:
+        err_msg = f"恢复失败: 快照损坏或校验失败: {e}"
+        console.print(f"[red]ERR[/] {err_msg}")
+        target_audit.log("snapshot_restore_fail", "", 0, err_msg)
+        sys.exit(1)
+    except SnapshotVersionError as e:
+        err_msg = f"恢复失败: 快照版本不兼容: {e}"
+        console.print(f"[red]ERR[/] {err_msg}")
+        target_audit.log("snapshot_restore_fail", "", 0, err_msg)
+        sys.exit(1)
+    except SnapshotConflictError as e:
+        err_msg = f"恢复失败: 冲突 - {e}"
+        console.print(f"[red]ERR[/] {err_msg}")
+        target_audit.log("snapshot_restore_fail", "", 0, err_msg)
+        sys.exit(1)
+    except SnapshotError as e:
+        err_msg = f"恢复失败: {e}"
+        console.print(f"[red]ERR[/] {err_msg}")
+        target_audit.log("snapshot_restore_fail", "", 0, err_msg)
+        sys.exit(1)
+    except Exception as e:
+        err_msg = f"恢复失败: 未知错误 {type(e).__name__}: {e}"
+        console.print(f"[red]ERR[/] {err_msg}")
+        target_audit.log("snapshot_restore_fail", "", 0, err_msg)
+        sys.exit(1)
+
+    strategy_label = {
+        "overwrite": "[red]overwrite[/] 覆盖",
+        "rename": "[cyan]rename[/] 改名",
+        "skip": "[green]skip[/] 无冲突直接导入",
+    }.get(result["strategy"], result["strategy"])
+
+    summary = (
+        f"恢复快照 {result['snapshot_id']} 成功: 原批次 "
+        f"{result['original_batch_name']}({result['original_batch_id']}) -> "
+        f"{result['batch_name']}({result['batch_id']}), "
+        f"策略 {result['strategy']}, 目标目录 {result['storage_dir']}"
+    )
+    target_audit.log("snapshot_restore", result["batch_id"], 1, summary)
+
+    console.print(Panel.fit(
+        f"[bold green]快照恢复成功[/]\n\n"
+        f"[bold cyan]快照ID:[/]        {result['snapshot_id']}\n"
+        f"[bold cyan]原批次ID:[/]      {result['original_batch_id']}\n"
+        f"[bold cyan]原批次名:[/]      {result['original_batch_name']}\n"
+        f"[bold cyan]新批次ID:[/]      {result['batch_id']}\n"
+        f"[bold cyan]新批次名:[/]      [bold]{result['batch_name']}[/]\n"
+        f"[bold cyan]冲突策略:[/]      {strategy_label}\n"
+        f"[bold cyan]规则恢复:[/]      {'[green]是[/] ' + (result.get('rules_path') or '') if result['rules_restored'] else '[yellow]否[/]（原批次未关联规则）'}\n"
+        f"[bold cyan]审计记录写回:[/]  {result['audit_inserted']} 条\n"
+        f"[bold cyan]配置合并:[/]      {'[green]已执行[/]' if result['config_merged'] else '无'}\n"
+        f"[bold cyan]目标目录:[/]      {result['storage_dir']}\n\n"
+        f"[dim]提示: 使用 resume {result['batch_id']} 查看详情[/]\n"
+        f"[dim]提示: 使用 export -b {result['batch_id']} -o <文件> 导出报告[/]\n"
+        f"[dim]提示: 使用 diff -b {result['batch_id']} 查询差异[/]\n"
+        f"[dim]提示: 使用 audit-log -b {result['batch_id']} 查询审计[/]",
+        title="快照恢复结果",
+    ))
 
 
 if __name__ == "__main__":

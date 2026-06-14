@@ -3028,6 +3028,585 @@ def test_scheduler_should_run_logic():
     print("[PASS] should_run_now 触发逻辑 测试通过\n")
 
 
+def _setup_full_batch(storage_dir: str, samples_dir: str, batch_name: str = "快照测试批次"):
+    from click.testing import CliRunner
+    from bank_reconcile.cli import cli
+
+    os.environ["BANK_RECONCILE_HOME"] = storage_dir
+    runner = CliRunner()
+
+    def check(desc, result, expected_exit=0):
+        assert result.exit_code == expected_exit, \
+            f"[{desc}] exit={result.exit_code} expect={expected_exit}, out={result.output}" \
+            + (f"\n exc={result.exception}" if result.exception else "")
+
+    r = runner.invoke(cli, ["create", batch_name])
+    check("create", r)
+    batch_line = [ln for ln in r.output.splitlines() if "BATCH-" in ln][0]
+    batch_id = batch_line.split("(ID: ")[1].rstrip(")").strip()
+
+    r = runner.invoke(cli, ["import", "-b", batch_id, "-t", "bank",
+                            os.path.join(samples_dir, "bank_statement.csv")])
+    check("import bank", r)
+
+    r = runner.invoke(cli, ["import", "-b", batch_id, "-t", "system",
+                            os.path.join(samples_dir, "system_receipt.csv")])
+    check("import system", r)
+
+    r = runner.invoke(cli, ["import", "-b", batch_id, "-t", "adjustment",
+                            os.path.join(samples_dir, "manual_adjustment.csv")])
+    check("import adjustment", r)
+
+    r = runner.invoke(cli, ["rules", "set", "-b", batch_id,
+                            os.path.join(samples_dir, "rules.yaml")])
+    check("rules set", r)
+
+    r = runner.invoke(cli, ["match", "-b", batch_id])
+    check("match", r)
+
+    storage = BatchStorage(storage_dir)
+    b = storage.load(batch_id)
+    assert len(b.discrepancies) > 0, "match 后应存在差异"
+    first_disp_id = b.discrepancies[0].discrepancy_id
+
+    r = runner.invoke(cli, ["mark", "-b", batch_id, "-d", first_disp_id,
+                          "-s", "confirmed", "-r", "snapshot_tester", "-n", "快照标记测试"])
+    check("mark", r)
+
+    export_path = os.path.join(storage_dir, "pre_snapshot_report.csv")
+    r = runner.invoke(cli, ["export", "-b", batch_id, "-o", export_path, "--with-summary"])
+    check("export", r)
+    assert os.path.isfile(export_path)
+
+    return batch_id, first_disp_id, export_path
+
+
+def test_snapshot_create_and_info():
+    print("=== 场景3-1: 快照创建与 info 查看 ===")
+    samples_dir = os.path.join(os.path.dirname(__file__), "samples")
+    src_dir = tempfile.mkdtemp(prefix="bank_reconcile_snap_src_")
+    snap_dir = tempfile.mkdtemp(prefix="bank_reconcile_snap_store_")
+
+    try:
+        from click.testing import CliRunner
+        from bank_reconcile.cli import cli
+        from bank_reconcile.snapshot import read_snapshot_info
+
+        batch_id, first_disp_id, pre_export = _setup_full_batch(src_dir, samples_dir, "快照创建测试")
+
+        storage = BatchStorage(src_dir)
+        pre_batch = storage.load(batch_id)
+        pre_disps = len(pre_batch.discrepancies)
+        pre_imported = len(pre_batch.imported_files)
+        print(f"  源批次: bank={len(pre_batch.bank_txns)} sys={len(pre_batch.system_txns)} "
+              f"adj={len(pre_batch.adjustment_txns)} disp={pre_disps}")
+
+        os.environ["BANK_RECONCILE_HOME"] = src_dir
+        runner = CliRunner()
+
+        def check(desc, result, expected_exit=0):
+            assert result.exit_code == expected_exit, \
+                f"[{desc}] exit={result.exit_code} expect={expected_exit}, out={result.output}" \
+                + (f"\n exc={result.exception}" if result.exception else "")
+            print(f"  [OK] {desc}")
+
+        snap_path = os.path.join(snap_dir, "mybatch.brsnap")
+        r = runner.invoke(cli, ["snapshot", "create", "-b", batch_id, "-o", snap_path])
+        check("snapshot create", r)
+        assert os.path.isfile(snap_path), "快照文件应落盘"
+        assert "快照创建成功" in r.output
+        assert batch_id in r.output
+        print(f"  快照文件: {snap_path}, 大小 {os.path.getsize(snap_path)/1024:.1f} KB")
+
+        r = runner.invoke(cli, ["snapshot", "info", snap_path])
+        check("snapshot info", r)
+        assert "完整性校验通过" in r.output
+        assert "快照ID" in r.output
+        assert "校验摘要 (SHA-256)" in r.output
+        assert batch_id in r.output
+        assert "内嵌规则" in r.output
+        print("  info 命令展示所有关键字段")
+
+        info = read_snapshot_info(snap_path)
+        assert info["snapshot_version"].startswith("1.")
+        assert info["batch_id"] == batch_id
+        assert info["discrepancy_count"] == pre_disps
+        assert info["imported_file_count"] == pre_imported
+        assert info["audit_record_count"] >= 5
+        assert info["payload_summary"]["has_rules_yaml"] is True
+        print(f"  read_snapshot_info: snapshot_id={info['snapshot_id']}, "
+              f"audit_records={info['audit_record_count']}")
+
+        r = runner.invoke(cli, ["snapshot", "create", "-b", "BATCH-NOTEXIST",
+                                "-o", os.path.join(snap_dir, "x.brsnap")])
+        check("snapshot create 不存在批次 (应失败)", r, expected_exit=1)
+        assert "批次不存在" in r.output or "ERR" in r.output
+        print("  create 不存在批次正确拒绝")
+
+        audit = AuditStorage(src_dir)
+        snap_records = audit.query(op_type="snapshot_create")
+        assert len(snap_records) >= 1, "应写入 snapshot_create 审计"
+        fail_records = audit.query(op_type="snapshot_create_fail")
+        assert len(fail_records) >= 1, "应写入 snapshot_create_fail 审计"
+        print(f"  审计写入: snapshot_create×{len(snap_records)}, snapshot_create_fail×{len(fail_records)}")
+
+        print("[PASS] 快照创建与 info 查看 通过\n")
+
+    finally:
+        if "BANK_RECONCILE_HOME" in os.environ:
+            del os.environ["BANK_RECONCILE_HOME"]
+        shutil.rmtree(src_dir, ignore_errors=True)
+        shutil.rmtree(snap_dir, ignore_errors=True)
+
+
+def test_snapshot_restore_cross_directory():
+    print("=== 场景3-2: 跨目录恢复 + 恢复后功能验证 ===")
+    samples_dir = os.path.join(os.path.dirname(__file__), "samples")
+    src_dir = tempfile.mkdtemp(prefix="bank_reconcile_snap_src2_")
+    dst_dir = tempfile.mkdtemp(prefix="bank_reconcile_snap_dst2_")
+    snap_dir = tempfile.mkdtemp(prefix="bank_reconcile_snap_file_")
+
+    try:
+        from click.testing import CliRunner
+        from bank_reconcile.cli import cli
+
+        batch_id, first_disp_id, pre_export = _setup_full_batch(src_dir, samples_dir, "跨目录恢复测试")
+
+        storage_src = BatchStorage(src_dir)
+        pre_batch = storage_src.load(batch_id)
+        pre_disps = len(pre_batch.discrepancies)
+        pre_summary = generate_summary(pre_batch)
+
+        snap_path = os.path.join(snap_dir, "crossdir.brsnap")
+        os.environ["BANK_RECONCILE_HOME"] = src_dir
+        runner = CliRunner()
+
+        def check(desc, result, expected_exit=0):
+            assert result.exit_code == expected_exit, \
+                f"[{desc}] exit={result.exit_code} expect={expected_exit}, out={result.output}" \
+                + (f"\n exc={result.exception}" if result.exception else "")
+            print(f"  [OK] {desc}")
+
+        r = runner.invoke(cli, ["snapshot", "create", "-b", batch_id, "-o", snap_path])
+        check("源: snapshot create", r)
+
+        r = runner.invoke(cli, ["snapshot", "restore", snap_path, "-d", dst_dir])
+        check("跨目录 snapshot restore", r)
+        assert "快照恢复成功" in r.output
+        assert batch_id in r.output
+        print("  跨目录恢复成功")
+
+        os.environ["BANK_RECONCILE_HOME"] = dst_dir
+
+        r = runner.invoke(cli, ["list"])
+        check("恢复后: list", r)
+        assert batch_id in r.output
+        assert "跨目录恢复测试" in r.output
+        print("  list 能看到恢复后的批次")
+
+        r = runner.invoke(cli, ["resume", batch_id])
+        check("恢复后: resume", r)
+        assert "批次信息" in r.output
+        assert str(pre_disps) in r.output
+        print("  resume 能看到恢复后的批次信息")
+
+        post_storage = BatchStorage(dst_dir)
+        post_batch = post_storage.load(batch_id)
+        post_summary = generate_summary(post_batch)
+        assert post_summary["total_discrepancies"] == pre_summary["total_discrepancies"]
+        assert post_summary["bank_transactions"] == pre_summary["bank_transactions"]
+        assert post_summary["system_transactions"] == pre_summary["system_transactions"]
+        assert post_summary["adjustment_transactions"] == pre_summary["adjustment_transactions"]
+        assert post_summary["exact_matches"] == pre_summary["exact_matches"]
+        assert post_summary["manual_matches"] == pre_summary["manual_matches"]
+        print(f"  汇总一致: total_disp={post_summary['total_discrepancies']}, "
+              f"exact={post_summary['exact_matches']}, manual={post_summary['manual_matches']}")
+
+        marked_disp = next(d for d in post_batch.discrepancies if d.discrepancy_id == first_disp_id)
+        assert marked_disp.status.value == "confirmed", "恢复后人工标记状态应保留"
+        assert marked_disp.reviewer == "snapshot_tester"
+        assert marked_disp.note == "快照标记测试"
+        assert len(marked_disp.rollback_history) >= 1, "恢复后回滚历史应保留"
+        print(f"  人工标记保留: status={marked_disp.status.value}, reviewer={marked_disp.reviewer}, "
+              f"rollback_entries={len(marked_disp.rollback_history)}")
+
+        r = runner.invoke(cli, ["rollback", "-b", batch_id, "-d", first_disp_id])
+        check("恢复后: rollback 可执行", r)
+        post_batch2 = post_storage.load(batch_id)
+        rolled = next(d for d in post_batch2.discrepancies if d.discrepancy_id == first_disp_id)
+        assert rolled.status.value == "open"
+        print("  rollback 可以正常工作（回滚后状态=open）")
+
+        post_export = os.path.join(dst_dir, "post_restore_report.csv")
+        r = runner.invoke(cli, ["export", "-b", batch_id, "-o", post_export, "--with-summary"])
+        check("恢复后: export", r)
+        assert os.path.isfile(post_export)
+
+        with open(pre_export, "r", encoding="utf-8-sig") as f1, \
+             open(post_export, "r", encoding="utf-8-sig") as f2:
+            pre_lines = f1.readlines()
+            post_lines = f2.readlines()
+        assert len(pre_lines) == len(post_lines), \
+            f"导出行数应一致: 源={len(pre_lines)} 目标={len(post_lines)}"
+        print(f"  导出报告行数一致: {len(pre_lines)} 行（差异记录数相同）")
+
+        r = runner.invoke(cli, ["diff", "-b", batch_id, "-n", "10"])
+        check("恢复后: diff 查询", r)
+        assert "未匹配记录" in r.output or "所有记录已匹配" in r.output
+        print("  diff 查询可执行")
+
+        r = runner.invoke(cli, ["discrepancies", "-b", batch_id, "-n", "10"])
+        check("恢复后: discrepancies 查询", r)
+        assert "差异清单" in r.output
+        print("  discrepancies 查询可执行")
+
+        audit_dst = AuditStorage(dst_dir)
+        snap_restore_records = audit_dst.query(op_type="snapshot_restore")
+        assert len(snap_restore_records) >= 1, "应写入 snapshot_restore 审计"
+        imported_audit = audit_dst.query(batch_id=batch_id)
+        assert len(imported_audit) >= 5, "恢复后应至少包含 5 条原始操作的审计记录"
+        commands_in_dst = {r["command"] for r in imported_audit}
+        assert "import" in commands_in_dst, "import 审计被恢复"
+        assert "match" in commands_in_dst, "match 审计被恢复"
+        assert "mark" in commands_in_dst, "mark 审计被恢复"
+        assert "snapshot_restore" in commands_in_dst, "snapshot_restore 审计被写入"
+        print(f"  审计记录: 共 {len(imported_audit)} 条, 类型={sorted(commands_in_dst)}")
+
+        r = runner.invoke(cli, ["audit-log", "-b", batch_id, "-t", "import"])
+        check("恢复后: audit-log -t import 查询", r)
+        assert "导入" in r.output
+        print("  audit-log 可正常过滤查询")
+
+        rules_dir = os.path.join(dst_dir, "restored_rules")
+        rules_files = [f for f in os.listdir(rules_dir)] if os.path.isdir(rules_dir) else []
+        assert len(rules_files) >= 1, "规则文件应被恢复到 restored_rules 目录"
+        print(f"  规则文件恢复: {rules_files}")
+
+        config_dst = load_config(dst_dir)
+        assert "column_aliases" in config_dst
+        print(f"  配置恢复: audit_retention_days={config_dst.get('audit_retention_days')}")
+
+        print("[PASS] 跨目录恢复与恢复后功能 全部通过\n")
+
+    finally:
+        if "BANK_RECONCILE_HOME" in os.environ:
+            del os.environ["BANK_RECONCILE_HOME"]
+        shutil.rmtree(src_dir, ignore_errors=True)
+        shutil.rmtree(dst_dir, ignore_errors=True)
+        shutil.rmtree(snap_dir, ignore_errors=True)
+
+
+def test_snapshot_conflict_strategies():
+    print("=== 场景3-3: 冲突处理策略 (skip/overwrite/rename) ===")
+    samples_dir = os.path.join(os.path.dirname(__file__), "samples")
+    src_dir = tempfile.mkdtemp(prefix="bank_reconcile_snap_src3_")
+    dst_dir = tempfile.mkdtemp(prefix="bank_reconcile_snap_dst3_")
+    snap_dir = tempfile.mkdtemp(prefix="bank_reconcile_snap_file3_")
+
+    try:
+        from click.testing import CliRunner
+        from bank_reconcile.cli import cli
+
+        batch_id, _, _ = _setup_full_batch(src_dir, samples_dir, "冲突策略测试")
+
+        snap_path = os.path.join(snap_dir, "conflict.brsnap")
+        os.environ["BANK_RECONCILE_HOME"] = src_dir
+        runner = CliRunner()
+
+        def check(desc, result, expected_exit=0):
+            assert result.exit_code == expected_exit, \
+                f"[{desc}] exit={result.exit_code} expect={expected_exit}, out={result.output}" \
+                + (f"\n exc={result.exception}" if result.exception else "")
+            print(f"  [OK] {desc}")
+
+        r = runner.invoke(cli, ["snapshot", "create", "-b", batch_id, "-o", snap_path])
+        check("源: snapshot create", r)
+
+        os.environ["BANK_RECONCILE_HOME"] = dst_dir
+        r = runner.invoke(cli, ["create", "冲突策略测试"])
+        check("目标: 创建同名批次", r)
+        dst_storage = BatchStorage(dst_dir)
+        dst_batches = dst_storage.list_batches()
+        dst_same_name_id = dst_batches[0]["batch_id"]
+        print(f"  目标已存在同名批次 ID={dst_same_name_id}")
+
+        r = runner.invoke(cli, ["snapshot", "restore", snap_path, "-d", dst_dir, "-s", "skip"])
+        check("restore strategy=skip (应冲突失败)", r, expected_exit=1)
+        assert "冲突" in r.output or "SKIP" in r.output.upper()
+        print("  strategy=skip 正确报告冲突并退出")
+
+        r = runner.invoke(cli, ["snapshot", "restore", snap_path, "-d", dst_dir,
+                                "-s", "rename", "--new-name", "冲突策略测试_改名版"])
+        check("restore strategy=rename", r)
+        assert "快照恢复成功" in r.output
+        assert "改名版" in r.output
+        print("  strategy=rename 成功恢复为新名称")
+
+        renamed_batches = [b for b in dst_storage.list_batches()
+                           if b["name"] == "冲突策略测试_改名版"]
+        assert len(renamed_batches) == 1
+        renamed_id = renamed_batches[0]["batch_id"]
+        assert renamed_id != batch_id, "rename 后 ID 必须改变"
+        print(f"  rename 后 ID 已变化: {batch_id} -> {renamed_id}")
+
+        r = runner.invoke(cli, ["snapshot", "restore", snap_path, "-d", dst_dir, "-s", "overwrite"])
+        check("restore strategy=overwrite (目标同ID还不存在，应直接导入)", r)
+        assert "快照恢复成功" in r.output
+        overwrite_batches = [b for b in dst_storage.list_batches()
+                             if b["batch_id"] == batch_id]
+        assert len(overwrite_batches) == 1, "overwrite 后源 ID 应存在于目标"
+        print(f"  overwrite 成功: 目标存在 ID={batch_id}")
+
+        original_overwrite_id = overwrite_batches[0]["batch_id"]
+        r = runner.invoke(cli, ["snapshot", "restore", snap_path, "-d", dst_dir, "-s", "overwrite"])
+        check("restore strategy=overwrite (覆盖已有同ID)", r)
+        after_overwrite = dst_storage.list_batches()
+        ids = [b["batch_id"] for b in after_overwrite]
+        assert ids.count(original_overwrite_id) == 1, "overwrite 后仍然只有一条同ID"
+        print("  overwrite 覆盖同ID不会重复插入")
+
+        audit_dst = AuditStorage(dst_dir)
+        fail_records = audit_dst.query(op_type="snapshot_restore_fail")
+        assert len(fail_records) >= 1, "应至少有一次 snapshot_restore_fail 审计（skip 那次）"
+        restore_records = audit_dst.query(op_type="snapshot_restore")
+        assert len(restore_records) >= 3, "应有三次成功恢复（rename + 两次 overwrite）"
+        print(f"  审计记录: restore_fail×{len(fail_records)}, restore×{len(restore_records)}")
+
+        print("[PASS] 冲突处理策略 通过\n")
+
+    finally:
+        if "BANK_RECONCILE_HOME" in os.environ:
+            del os.environ["BANK_RECONCILE_HOME"]
+        shutil.rmtree(src_dir, ignore_errors=True)
+        shutil.rmtree(dst_dir, ignore_errors=True)
+        shutil.rmtree(snap_dir, ignore_errors=True)
+
+
+def test_snapshot_corrupted_rejected():
+    print("=== 场景3-4: 损坏快照拒绝恢复 ===")
+    samples_dir = os.path.join(os.path.dirname(__file__), "samples")
+    src_dir = tempfile.mkdtemp(prefix="bank_reconcile_snap_src4_")
+    dst_dir = tempfile.mkdtemp(prefix="bank_reconcile_snap_dst4_")
+    snap_dir = tempfile.mkdtemp(prefix="bank_reconcile_snap_file4_")
+
+    try:
+        from click.testing import CliRunner
+        from bank_reconcile.cli import cli
+        from bank_reconcile.snapshot import (
+            read_snapshot_info, restore_snapshot, ConflictStrategy,
+            SnapshotCorruptedError, SnapshotVersionError,
+        )
+
+        batch_id, _, _ = _setup_full_batch(src_dir, samples_dir, "损坏快照测试")
+
+        snap_path = os.path.join(snap_dir, "valid.brsnap")
+        os.environ["BANK_RECONCILE_HOME"] = src_dir
+        runner = CliRunner()
+
+        def check(desc, result, expected_exit=0):
+            assert result.exit_code == expected_exit, \
+                f"[{desc}] exit={result.exit_code} expect={expected_exit}, out={result.output}" \
+                + (f"\n exc={result.exception}" if result.exception else "")
+            print(f"  [OK] {desc}")
+
+        r = runner.invoke(cli, ["snapshot", "create", "-b", batch_id, "-o", snap_path])
+        check("snapshot create", r)
+
+        bad_json = os.path.join(snap_dir, "bad_json.brsnap")
+        with open(bad_json, "w", encoding="utf-8") as f:
+            f.write("this is not json{{{{")
+        try:
+            read_snapshot_info(bad_json)
+            assert False, "非法JSON应抛异常"
+        except SnapshotCorruptedError as e:
+            assert "合法 JSON" in str(e) or "JSON" in str(e)
+            print(f"  非法JSON 正确拒绝: {e}")
+        r = runner.invoke(cli, ["snapshot", "restore", bad_json, "-d", dst_dir])
+        check("restore 非法JSON (应失败)", r, expected_exit=1)
+
+        import json as _json
+        with open(snap_path, "r", encoding="utf-8") as f:
+            data = _json.load(f)
+        data["checksum"] = "0000000000000000000000000000000000000000000000000000000000000000"
+        bad_checksum = os.path.join(snap_dir, "bad_checksum.brsnap")
+        with open(bad_checksum, "w", encoding="utf-8") as f:
+            _json.dump(data, f, ensure_ascii=False, indent=2)
+        try:
+            read_snapshot_info(bad_checksum)
+            assert False, "错误checksum应抛异常"
+        except SnapshotCorruptedError as e:
+            assert "校验失败" in str(e)
+            print(f"  错误 checksum 正确拒绝: {e}")
+        r = runner.invoke(cli, ["snapshot", "restore", bad_checksum, "-d", dst_dir])
+        check("restore 错误checksum (应失败)", r, expected_exit=1)
+
+        data2 = dict(data)
+        data2["snapshot_version"] = "99.99.99"
+        data2["payload"]["batch"]["bank_txns"][0]["txn_id"] = data2["payload"]["batch"]["bank_txns"][0]["txn_id"]
+        data2["checksum"] = "00" * 32
+        bad_version = os.path.join(snap_dir, "bad_version.brsnap")
+        with open(bad_version, "w", encoding="utf-8") as f:
+            _json.dump(data2, f, ensure_ascii=False, indent=2)
+        try:
+            read_snapshot_info(bad_version)
+            assert False, "错误版本应抛异常"
+        except SnapshotVersionError as e:
+            assert "不兼容" in str(e) or "版本" in str(e)
+            print(f"  不兼容版本 正确拒绝: {e}")
+        r = runner.invoke(cli, ["snapshot", "restore", bad_version, "-d", dst_dir])
+        check("restore 不兼容版本 (应失败)", r, expected_exit=1)
+
+        with open(snap_path, "r", encoding="utf-8") as f:
+            data3 = _json.load(f)
+        data3["payload"]["batch"]["bank_txns"].append({
+            "txn_id": "tampered", "amount": 999999.99, "date": "2099-01-01",
+            "file_type": "bank_statement", "source_file": "x", "source_row": 0,
+        })
+        bad_payload = os.path.join(snap_dir, "bad_payload.brsnap")
+        with open(bad_payload, "w", encoding="utf-8") as f:
+            _json.dump(data3, f, ensure_ascii=False, indent=2)
+        try:
+            read_snapshot_info(bad_payload)
+            assert False, "篡改payload(未同步checksum)应抛异常"
+        except SnapshotCorruptedError as e:
+            assert "校验失败" in str(e)
+            print(f"  篡改 payload 后 checksum 校验失败: {e}")
+        dst_storage = BatchStorage(dst_dir)
+        try:
+            restore_snapshot(bad_payload, dst_storage, ConflictStrategy.SKIP)
+            assert False, "篡改payload后restore应失败"
+        except SnapshotCorruptedError:
+            print("  restore 层也正确拒绝篡改后的快照")
+
+        nonexistent = os.path.join(snap_dir, "does_not_exist.brsnap")
+        r = runner.invoke(cli, ["snapshot", "info", nonexistent])
+        check("info 不存在快照 (应失败)", r, expected_exit=1)
+        r = runner.invoke(cli, ["snapshot", "restore", nonexistent, "-d", dst_dir])
+        check("restore 不存在快照 (应失败)", r, expected_exit=1)
+        print("  不存在文件 正确拒绝")
+
+        print("[PASS] 损坏快照拒绝恢复 通过\n")
+
+    finally:
+        if "BANK_RECONCILE_HOME" in os.environ:
+            del os.environ["BANK_RECONCILE_HOME"]
+        shutil.rmtree(src_dir, ignore_errors=True)
+        shutil.rmtree(dst_dir, ignore_errors=True)
+        shutil.rmtree(snap_dir, ignore_errors=True)
+
+
+def test_snapshot_export_consistency_and_audit():
+    print("=== 场景3-5: 恢复前后导出一致 + 审计可查询 ===")
+    samples_dir = os.path.join(os.path.dirname(__file__), "samples")
+    src_dir = tempfile.mkdtemp(prefix="bank_reconcile_snap_src5_")
+    dst_dir = tempfile.mkdtemp(prefix="bank_reconcile_snap_dst5_")
+    snap_dir = tempfile.mkdtemp(prefix="bank_reconcile_snap_file5_")
+
+    try:
+        from click.testing import CliRunner
+        from bank_reconcile.cli import cli
+
+        batch_id, _, _ = _setup_full_batch(src_dir, samples_dir, "导出一致测试")
+
+        os.environ["BANK_RECONCILE_HOME"] = src_dir
+        runner = CliRunner()
+
+        def check(desc, result, expected_exit=0):
+            assert result.exit_code == expected_exit, \
+                f"[{desc}] exit={result.exit_code} expect={expected_exit}, out={result.output}" \
+                + (f"\n exc={result.exception}" if result.exception else "")
+            print(f"  [OK] {desc}")
+
+        pre_summary_csv = os.path.join(src_dir, "pre_summary.csv")
+        r = runner.invoke(cli, ["report", "summary", "-b", batch_id, "--export", pre_summary_csv])
+        check("源: report summary --export", r)
+        assert os.path.isfile(pre_summary_csv)
+
+        pre_diff_csv = os.path.join(src_dir, "pre_diff.csv")
+        r = runner.invoke(cli, ["diff", "-b", batch_id, "--export", pre_diff_csv, "-n", "1000"])
+        check("源: diff --export", r)
+        assert os.path.isfile(pre_diff_csv)
+
+        snap_path = os.path.join(snap_dir, "consist.brsnap")
+        r = runner.invoke(cli, ["snapshot", "create", "-b", batch_id, "-o", snap_path])
+        check("源: snapshot create", r)
+
+        r = runner.invoke(cli, ["snapshot", "restore", snap_path, "-d", dst_dir])
+        check("restore 到 dst", r)
+
+        os.environ["BANK_RECONCILE_HOME"] = dst_dir
+        r = runner.invoke(cli, ["resume", batch_id])
+        check("恢复后: resume", r)
+
+        post_summary_csv = os.path.join(dst_dir, "post_summary.csv")
+        r = runner.invoke(cli, ["report", "summary", "-b", batch_id, "--export", post_summary_csv])
+        check("恢复后: report summary --export", r)
+        assert os.path.isfile(post_summary_csv)
+
+        with open(pre_summary_csv, "r", encoding="utf-8-sig") as f1, \
+             open(post_summary_csv, "r", encoding="utf-8-sig") as f2:
+            def _filter_summary(lines):
+                out = []
+                for ln in lines:
+                    s = ln.strip()
+                    if not s:
+                        continue
+                    if s.startswith("创建时间,") or s.startswith("更新时间,") \
+                            or s.startswith("批次ID,") or s.startswith("批次名称,"):
+                        continue
+                    out.append(s)
+                return out
+            pre_lines = _filter_summary(f1.readlines())
+            post_lines = _filter_summary(f2.readlines())
+        assert pre_lines == post_lines, "summary CSV 统计部分应逐行一致（排除时间元数据）"
+        print(f"  summary CSV 统计部分完全一致: {len(pre_lines)} 行")
+
+        post_diff_csv = os.path.join(dst_dir, "post_diff.csv")
+        r = runner.invoke(cli, ["diff", "-b", batch_id, "--export", post_diff_csv, "-n", "1000"])
+        check("恢复后: diff --export", r)
+        assert os.path.isfile(post_diff_csv)
+
+        with open(pre_diff_csv, "r", encoding="utf-8-sig") as f1, \
+             open(post_diff_csv, "r", encoding="utf-8-sig") as f2:
+            pre_diff_lines = [ln.strip() for ln in f1.readlines() if ln.strip()]
+            post_diff_lines = [ln.strip() for ln in f2.readlines() if ln.strip()]
+        assert pre_diff_lines == post_diff_lines, "diff CSV 应逐行完全一致"
+        print(f"  diff CSV 完全一致: {len(pre_diff_lines)} 行")
+
+        audit_dst = AuditStorage(dst_dir)
+        all_ops = audit_dst.query(batch_id=batch_id)
+        op_types = sorted({r["command"] for r in all_ops})
+        expected_ops = {"import", "match", "mark", "snapshot_restore"}
+        assert expected_ops.issubset(set(op_types)), \
+            f"审计应包含 {expected_ops}, 实际 {op_types}"
+        print(f"  审计类型完整: {op_types}")
+
+        mark_records = [r for r in all_ops if r["command"] == "mark"]
+        assert len(mark_records) == 1, "应包含一条 mark 审计"
+        assert "snapshot_tester" in mark_records[0]["summary"]
+        print(f"  mark 审计详情: affected={mark_records[0]['affected']}, "
+              f"summary[:80]={mark_records[0]['summary'][:80]}")
+
+        r = runner.invoke(cli, ["audit-log", "-t", "snapshot_create", "-b", batch_id])
+        check("audit-log -t snapshot_create (源目录类型)", r, expected_exit=0)
+
+        r = runner.invoke(cli, ["audit-log", "-t", "snapshot_restore", "-b", batch_id])
+        check("audit-log -t snapshot_restore (恢复成功)", r, expected_exit=0)
+        assert "snapshot_restore" in r.output or "审计日志" in r.output
+
+        r = runner.invoke(cli, ["audit-log", "-t", "snapshot_restore_fail"])
+        check("audit-log -t snapshot_restore_fail (无则空表)", r, expected_exit=0)
+
+        print("[PASS] 导出一致性 & 审计查询 通过\n")
+
+    finally:
+        if "BANK_RECONCILE_HOME" in os.environ:
+            del os.environ["BANK_RECONCILE_HOME"]
+        shutil.rmtree(src_dir, ignore_errors=True)
+        shutil.rmtree(dst_dir, ignore_errors=True)
+        shutil.rmtree(snap_dir, ignore_errors=True)
+
+
 def main():
     try:
         test_parser()
@@ -3066,6 +3645,11 @@ def main():
         test_schedule_failure_retry_and_audit()
         test_schedule_cli_commands()
         test_scheduler_should_run_logic()
+        test_snapshot_create_and_info()
+        test_snapshot_restore_cross_directory()
+        test_snapshot_conflict_strategies()
+        test_snapshot_corrupted_rejected()
+        test_snapshot_export_consistency_and_audit()
         print("=" * 50)
         print("所有测试通过！")
         print("=" * 50)
