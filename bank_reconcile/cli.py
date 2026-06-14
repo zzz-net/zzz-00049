@@ -10,8 +10,8 @@ from rich.console import Console
 from rich.table import Table
 from rich.panel import Panel
 
-from .models import Batch, FileType, DiscrepancyStatus, DiscrepancyType
-from .parser import parse_csv, ParseResult
+from .models import Batch, FileType, DiscrepancyStatus, DiscrepancyType, BatchStatus
+from .parser import parse_csv, parse_xlsx, parse_file, ParseResult
 from .rules import load_rules, RuleValidationError
 from .matcher import run_matching
 from .storage import BatchStorage
@@ -51,9 +51,11 @@ def _maybe_cleanup_audit(audit: AuditStorage, storage: BatchStorage) -> None:
 
 def _print_batch_info(batch: Batch) -> None:
     summary = generate_summary(batch)
+    status_style = "green" if batch.status == BatchStatus.OPEN else "dim"
     console.print(Panel.fit(
         f"[bold cyan]批次:[/] {summary['batch_name']}  "
-        f"[dim]({summary['batch_id']})[/]\n"
+        f"[dim]({summary['batch_id']})[/]  "
+        f"[bold {status_style}]状态: {batch.status.value}[/]\n"
         f"银行回单: {summary['bank_transactions']}  "
         f"系统流水: {summary['system_transactions']}  "
         f"手工调整: {summary['adjustment_transactions']}\n"
@@ -91,15 +93,19 @@ def list_batches() -> None:
     table = Table(title="批次列表")
     table.add_column("批次ID", style="cyan")
     table.add_column("名称", style="bold")
+    table.add_column("状态", style="bold")
     table.add_column("创建时间", style="dim")
     table.add_column("更新时间", style="dim")
     table.add_column("差异数", justify="right")
     table.add_column("导入文件数", justify="right")
 
     for b in batches:
+        status = b.get("status", "open")
+        status_style = "green" if status == "open" else "dim"
         table.add_row(
             b["batch_id"],
             b["name"],
+            f"[{status_style}]{status}[/]",
             b["created_at"][:19].replace("T", " "),
             b["updated_at"][:19].replace("T", " "),
             str(b["discrepancy_count"]),
@@ -123,6 +129,10 @@ def import_file(batch_id: str, file_type: str, file_path: str) -> None:
 
     batch = storage.load(batch_id)
 
+    if batch.is_closed:
+        console.print(f"[red]ERR[/] 批次已关闭（closed），禁止导入。请先 reopen 后再操作。")
+        sys.exit(1)
+
     type_map = {
         "bank": FileType.BANK_STATEMENT,
         "system": FileType.SYSTEM_RECEIPT,
@@ -131,7 +141,7 @@ def import_file(batch_id: str, file_type: str, file_path: str) -> None:
     ft = type_map[file_type]
 
     try:
-        result, imported = parse_csv(file_path, ft, storage_dir=storage.storage_dir)
+        result, imported = parse_file(file_path, ft, storage_dir=storage.storage_dir)
     except FileNotFoundError as e:
         console.print(f"[red]ERR[/] {e}")
         sys.exit(1)
@@ -220,6 +230,10 @@ def match(batch_id: str, rule_file: Optional[str]) -> None:
         sys.exit(1)
 
     batch = storage.load(batch_id)
+
+    if batch.is_closed:
+        console.print(f"[red]ERR[/] 批次已关闭（closed），禁止匹配。请先 reopen 后再操作。")
+        sys.exit(1)
 
     rule_path = rule_file or batch.rule_file
     try:
@@ -328,6 +342,11 @@ def mark(batch_id: str, discrepancy_id: str, status: str, reviewer: str, note: s
         sys.exit(1)
 
     batch = storage.load(batch_id)
+
+    if batch.is_closed:
+        console.print(f"[red]ERR[/] 批次已关闭（closed），禁止标记。请先 reopen 后再操作。")
+        sys.exit(1)
+
     target_status = DiscrepancyStatus(status)
 
     found = None
@@ -369,6 +388,10 @@ def rollback(batch_id: str, discrepancy_id: str) -> None:
         sys.exit(1)
 
     batch = storage.load(batch_id)
+
+    if batch.is_closed:
+        console.print(f"[red]ERR[/] 批次已关闭（closed），禁止回滚。请先 reopen 后再操作。")
+        sys.exit(1)
 
     found = None
     for d in batch.discrepancies:
@@ -485,12 +508,58 @@ def export(batch_id: str, output: str, status: Optional[str], disp_type: Optiona
         console.print(f"[green]OK[/] 摘要已导出到 [cyan]{summary_path}[/]")
 
 
+# ── close ─────────────────────────────────────────────────
+@cli.command(help="关闭批次（归档），关闭后禁止导入/匹配/标记/回滚")
+@click.option("--batch-id", "-b", required=True, help="批次ID")
+def close(batch_id: str) -> None:
+    storage = _get_storage()
+    if not storage.batch_exists(batch_id):
+        console.print(f"[red]ERR[/] 批次不存在: {batch_id}")
+        sys.exit(1)
+
+    batch = storage.load(batch_id)
+    changed = batch.close()
+    storage.save(batch)
+
+    audit = _get_audit(storage)
+    audit.log("close", batch_id, 0, f"关闭批次 {batch.name}" if changed else f"批次 {batch.name} 已处于关闭状态")
+    _maybe_cleanup_audit(audit, storage)
+
+    if changed:
+        console.print(f"[green]OK[/] 批次已关闭: [bold]{batch.name}[/] ({batch.batch_id})")
+    else:
+        console.print(f"[yellow]WARN[/] 批次已处于关闭状态: [bold]{batch.name}[/]")
+
+
+# ── reopen ────────────────────────────────────────────────
+@cli.command(help="重新打开已关闭的批次")
+@click.option("--batch-id", "-b", required=True, help="批次ID")
+def reopen(batch_id: str) -> None:
+    storage = _get_storage()
+    if not storage.batch_exists(batch_id):
+        console.print(f"[red]ERR[/] 批次不存在: {batch_id}")
+        sys.exit(1)
+
+    batch = storage.load(batch_id)
+    changed = batch.reopen()
+    storage.save(batch)
+
+    audit = _get_audit(storage)
+    audit.log("reopen", batch_id, 0, f"重新打开批次 {batch.name}" if changed else f"批次 {batch.name} 已处于打开状态")
+    _maybe_cleanup_audit(audit, storage)
+
+    if changed:
+        console.print(f"[green]OK[/] 批次已重新打开: [bold]{batch.name}[/] ({batch.batch_id})")
+    else:
+        console.print(f"[yellow]WARN[/] 批次已处于打开状态: [bold]{batch.name}[/]")
+
+
 # ── audit-log ────────────────────────────────────────────
 @cli.command("audit-log", help="查看/导出操作审计日志")
 @click.option("--from", "from_date", default=None, help="起始日期 (YYYY-MM-DD)")
 @click.option("--to", "to_date", default=None, help="截止日期 (YYYY-MM-DD)")
 @click.option("--type", "-t", "op_type", default=None,
-              type=click.Choice(["import", "match", "mark", "rollback"]),
+              type=click.Choice(["import", "match", "mark", "rollback", "close", "reopen"]),
               help="按操作类型过滤")
 @click.option("--batch", "-b", "batch_id", default=None, help="按批次ID过滤")
 @click.option("--output", "-o", default=None, help="导出文件路径（需配合 --format）")

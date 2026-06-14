@@ -38,6 +38,7 @@ class BatchStorage:
                 results.append({
                     "batch_id": data.get("batch_id"),
                     "name": data.get("name"),
+                    "status": data.get("status", "open"),
                     "created_at": data.get("created_at"),
                     "updated_at": data.get("updated_at"),
                     "discrepancy_count": len(data.get("discrepancies", [])),

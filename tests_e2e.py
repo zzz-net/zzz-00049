@@ -9,7 +9,7 @@ from contextlib import redirect_stdout
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from bank_reconcile.models import Batch, FileType, DiscrepancyStatus, DiscrepancyType
-from bank_reconcile.parser import parse_csv
+from bank_reconcile.parser import parse_csv, parse_xlsx, parse_file
 from bank_reconcile.rules import load_rules, RuleValidationError, MatchRules
 from bank_reconcile.matcher import run_matching
 from bank_reconcile.storage import BatchStorage
@@ -682,6 +682,298 @@ def test_audit_retention_cleanup():
         shutil.rmtree(tmpdir, ignore_errors=True)
 
 
+def test_close_reopen_import_block():
+    """场景1: close 之后导入被拒 → reopen 之后正常导入."""
+    print("=== 场景1: close/reopen 导入权限控制 ===")
+    samples_dir = os.path.join(os.path.dirname(__file__), "samples")
+    tmpdir = tempfile.mkdtemp(prefix="bank_reconcile_close_import_")
+
+    try:
+        os.environ["BANK_RECONCILE_HOME"] = tmpdir
+
+        from click.testing import CliRunner
+        from bank_reconcile.cli import cli
+
+        runner = CliRunner()
+
+        def check(desc, result, expected_exit=0):
+            assert result.exit_code == expected_exit, \
+                f"[{desc}] 退出码 {result.exit_code}, 期望 {expected_exit}, stdout={result.output}" \
+                + (f"\nexception={result.exception}" if result.exception else "")
+            print(f"  [OK] {desc}: exit={expected_exit}")
+
+        r = runner.invoke(cli, ["create", "关闭重开测试"])
+        check("create", r)
+        batch_line = [ln for ln in r.output.splitlines() if "BATCH-" in ln][0]
+        batch_id = batch_line.split("(ID: ")[1].rstrip(")").strip()
+
+        r = runner.invoke(cli, ["close", "-b", batch_id])
+        check("close", r)
+        assert "批次已关闭" in r.output
+
+        storage = BatchStorage(tmpdir)
+        b = storage.load(batch_id)
+        assert b.is_closed, "批次应为 closed 状态"
+        assert b.status.value == "closed"
+        print("  模型层状态校验: closed OK")
+
+        r = runner.invoke(cli, ["import", "-b", batch_id, "-t", "bank",
+                            os.path.join(samples_dir, "bank_statement.csv")])
+        check("import while closed (应被拒)", r, expected_exit=1)
+        assert "批次已关闭" in r.output and "禁止导入" in r.output, \
+            f"应提示禁止导入, 实际输出: {r.output}"
+        print("  关闭后 import 被拒绝: OK")
+
+        b_after = storage.load(batch_id)
+        assert len(b_after.bank_txns) == 0, "关闭状态下不应真的写入数据"
+        print("  关闭状态下无副作用 (无数据写入): OK")
+
+        r = runner.invoke(cli, ["reopen", "-b", batch_id])
+        check("reopen", r)
+        assert "批次已重新打开" in r.output
+
+        b = storage.load(batch_id)
+        assert b.is_open, "reopen 后应为 open 状态"
+        print("  模型层状态校验: reopen OK")
+
+        r = runner.invoke(cli, ["import", "-b", batch_id, "-t", "bank",
+                            os.path.join(samples_dir, "bank_statement.csv")])
+        check("import after reopen", r)
+        b = storage.load(batch_id)
+        assert len(b.bank_txns) > 0, "reopen 后应能正常导入"
+        print(f"  reopen 后导入成功: {len(b.bank_txns)} 条银行回单")
+
+        audit = AuditStorage(tmpdir)
+        records = audit.query(batch_id=batch_id)
+        cmds = {rec["command"] for rec in records}
+        assert "close" in cmds, "close 操作应写入审计日志"
+        assert "reopen" in cmds, "reopen 操作应写入审计日志"
+        assert "import" in cmds, "import 操作应写入审计日志"
+        print(f"  审计日志包含 close/reopen/import: {sorted(cmds)}")
+
+        print("[PASS] 场景1 (close/reopen 导入权限) 通过\n")
+
+    finally:
+        if "BANK_RECONCILE_HOME" in os.environ:
+            del os.environ["BANK_RECONCILE_HOME"]
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+
+def test_xlsx_import_field_values():
+    """场景2: 拿一份 xlsx 导入确认字段值都对."""
+    print("=== 场景2: XLSX 导入字段值校验 ===")
+    samples_dir = os.path.join(os.path.dirname(__file__), "samples")
+    tmpdir = tempfile.mkdtemp(prefix="bank_reconcile_xlsx_")
+
+    try:
+        csv_path = os.path.join(samples_dir, "bank_statement.csv")
+        xlsx_path = os.path.join(tmpdir, "bank_statement.xlsx")
+
+        from openpyxl import Workbook
+        import csv as _csv
+
+        wb = Workbook()
+        ws = wb.active
+        ws.title = "银行流水"
+        with open(csv_path, "r", encoding="utf-8-sig", newline="") as f:
+            reader = _csv.reader(f)
+            for row in reader:
+                ws.append(row)
+        wb.save(xlsx_path)
+        print(f"  生成测试 XLSX: {xlsx_path}")
+
+        csv_result, _ = parse_csv(csv_path, FileType.BANK_STATEMENT)
+        xlsx_result, xlsx_imported = parse_xlsx(xlsx_path, FileType.BANK_STATEMENT)
+
+        assert csv_result.row_count == xlsx_result.row_count, \
+            f"XLSX 行数应与 CSV 一致: CSV={csv_result.row_count} XLSX={xlsx_result.row_count}"
+        print(f"  有效记录数一致: {csv_result.row_count} 条")
+
+        assert len(csv_result.errors) == len(xlsx_result.errors), \
+            f"XLSX 错误数应与 CSV 一致: CSV={len(csv_result.errors)} XLSX={len(xlsx_result.errors)}"
+        assert len(csv_result.duplicates) == len(xlsx_result.duplicates), \
+            f"XLSX 重复数应与 CSV 一致"
+        print(f"  错误数一致: {len(csv_result.errors)} 条错误 / {len(csv_result.duplicates)} 条重复")
+
+        csv_ids = [t.txn_id for t in csv_result.transactions]
+        xlsx_ids = [t.txn_id for t in xlsx_result.transactions]
+        assert csv_ids == xlsx_ids, f"交易号顺序应一致: {csv_ids} vs {xlsx_ids}"
+        print(f"  交易号顺序一致: {csv_ids[:5]}...")
+
+        for i in range(min(csv_result.row_count, 12)):
+            ct = csv_result.transactions[i]
+            xt = xlsx_result.transactions[i]
+            assert ct.txn_id == xt.txn_id, f"行{i} txn_id 不一致"
+            assert abs(ct.amount - xt.amount) < 1e-9, \
+                f"行{i} amount 不一致: {ct.amount} vs {xt.amount}"
+            assert ct.date == xt.date, \
+                f"行{i} date 不一致: '{ct.date}' vs '{xt.date}'"
+            assert ct.counterparty == xt.counterparty, \
+                f"行{i} counterparty 不一致: '{ct.counterparty}' vs '{xt.counterparty}'"
+            assert ct.description == xt.description, \
+                f"行{i} description 不一致: '{ct.description}' vs '{xt.description}'"
+            assert ct.currency == xt.currency, \
+                f"行{i} currency 不一致: '{ct.currency}' vs '{xt.currency}'"
+            assert ct.source_row == xt.source_row, \
+                f"行{i} source_row 不一致: {ct.source_row} vs {xt.source_row}"
+            assert ct.file_type == xt.file_type, \
+                f"行{i} file_type 不一致"
+        print("  全部字段逐行对比 (txn_id/amount/date/counterparty/description/currency/source_row) 一致: OK")
+
+        csv_error_types = {e.error_type for e in csv_result.errors}
+        xlsx_error_types = {e.error_type for e in xlsx_result.errors}
+        assert csv_error_types == xlsx_error_types, f"错误类型应一致: {csv_error_types} vs {xlsx_error_types}"
+        print(f"  错误类型一致: {sorted(csv_error_types)}")
+
+        xlsx_dup_types = {d.error_type for d in xlsx_result.duplicates}
+        assert "duplicate_txn_id" in xlsx_dup_types, "XLSX 也应检测到重复流水"
+        print(f"  重复检测: {len(xlsx_result.duplicates)} 条 duplicate_txn_id")
+
+        assert xlsx_imported.file_type == FileType.BANK_STATEMENT
+        assert xlsx_imported.row_count == xlsx_result.row_count
+        assert xlsx_imported.error_count == xlsx_result.error_count
+        assert os.path.basename(xlsx_imported.file_path) == "bank_statement.xlsx"
+        print("  ImportedFile 记录字段正确 (type/row/error/file_path): OK")
+
+        os.environ["BANK_RECONCILE_HOME"] = tmpdir
+        from click.testing import CliRunner
+        from bank_reconcile.cli import cli
+        runner = CliRunner()
+
+        r = runner.invoke(cli, ["create", "xlsx_import_test"])
+        batch_line = [ln for ln in r.output.splitlines() if "BATCH-" in ln][0]
+        batch_id = batch_line.split("(ID: ")[1].rstrip(")").strip()
+
+        r = runner.invoke(cli, ["import", "-b", batch_id, "-t", "bank", xlsx_path])
+        assert r.exit_code == 0, f"CLI xlsx import 应成功: {r.output}"
+        assert "有效记录" in r.output, "CLI 输出应显示有效记录数"
+        assert "重复流水号" in r.output, "CLI 输出应显示重复告警 (B002)"
+        print("  CLI 端 XLSX import 集成成功，输出含有效记录+重复告警: OK")
+
+        storage2 = BatchStorage(tmpdir)
+        b = storage2.load(batch_id)
+        assert len(b.bank_txns) == xlsx_result.row_count, "CLI import 后批次中的交易数应匹配"
+        assert len(b.imported_files) == 1
+        assert b.imported_files[0].file_path.endswith(".xlsx")
+        print(f"  批次持久化校验: {len(b.bank_txns)} 条交易，导入文件记录为 .xlsx: OK")
+
+        print("[PASS] 场景2 (XLSX 导入字段值) 通过\n")
+
+    finally:
+        if "BANK_RECONCILE_HOME" in os.environ:
+            del os.environ["BANK_RECONCILE_HOME"]
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+
+def test_close_block_mark_rollback_match():
+    """场景3: close 之后 mark 和 rollback 全部被拒 (顺手测 match 也被拒)."""
+    print("=== 场景3: close 后 mark/rollback/match 权限控制 ===")
+    samples_dir = os.path.join(os.path.dirname(__file__), "samples")
+    tmpdir = tempfile.mkdtemp(prefix="bank_reconcile_close_ops_")
+
+    try:
+        os.environ["BANK_RECONCILE_HOME"] = tmpdir
+
+        from click.testing import CliRunner
+        from bank_reconcile.cli import cli
+
+        runner = CliRunner()
+
+        def check(desc, result, expected_exit=0):
+            assert result.exit_code == expected_exit, \
+                f"[{desc}] 退出码 {result.exit_code}, 期望 {expected_exit}, stdout={result.output}"
+            print(f"  [OK] {desc}: exit={expected_exit}")
+
+        r = runner.invoke(cli, ["create", "操作权限测试"])
+        check("create", r)
+        batch_line = [ln for ln in r.output.splitlines() if "BATCH-" in ln][0]
+        batch_id = batch_line.split("(ID: ")[1].rstrip(")").strip()
+
+        r = runner.invoke(cli, ["import", "-b", batch_id, "-t", "bank",
+                            os.path.join(samples_dir, "bank_statement.csv")])
+        check("import bank (open)", r)
+        r = runner.invoke(cli, ["import", "-b", batch_id, "-t", "system",
+                            os.path.join(samples_dir, "system_receipt.csv")])
+        check("import system (open)", r)
+        r = runner.invoke(cli, ["import", "-b", batch_id, "-t", "adjustment",
+                            os.path.join(samples_dir, "manual_adjustment.csv")])
+        check("import adjustment (open)", r)
+
+        r = runner.invoke(cli, ["match", "-b", batch_id])
+        check("match (open)", r)
+
+        storage = BatchStorage(tmpdir)
+        b = storage.load(batch_id)
+        assert len(b.discrepancies) > 0, "匹配后应有差异"
+        first_disp_id = b.discrepancies[0].discrepancy_id
+        print(f"  生成差异 {len(b.discrepancies)} 条, 选 {first_disp_id} 做后续操作")
+
+        r = runner.invoke(cli, ["close", "-b", batch_id])
+        check("close", r)
+
+        r = runner.invoke(cli, ["match", "-b", batch_id])
+        check("match while closed (应被拒)", r, expected_exit=1)
+        assert "禁止匹配" in r.output, f"match 应被禁止, 输出: {r.output}"
+        print("  关闭后 match 被拒绝: OK")
+
+        r = runner.invoke(cli, ["mark", "-b", batch_id, "-d", first_disp_id,
+                              "-s", "confirmed", "-r", "block_tester", "-n", "不应成功"])
+        check("mark while closed (应被拒)", r, expected_exit=1)
+        assert "禁止标记" in r.output, f"mark 应被禁止, 输出: {r.output}"
+        print("  关闭后 mark 被拒绝: OK")
+
+        r = runner.invoke(cli, ["rollback", "-b", batch_id, "-d", first_disp_id])
+        check("rollback while closed (应被拒)", r, expected_exit=1)
+        assert "禁止回滚" in r.output, f"rollback 应被禁止, 输出: {r.output}"
+        print("  关闭后 rollback 被拒绝: OK")
+
+        b_after = storage.load(batch_id)
+        disp_after = next(d for d in b_after.discrepancies if d.discrepancy_id == first_disp_id)
+        assert disp_after.status == DiscrepancyStatus.OPEN, \
+            "关闭状态下 mark 不应改变差异状态"
+        assert disp_after.reviewer is None, \
+            "关闭状态下 mark 不应写入 reviewer"
+        assert disp_after.note == "", \
+            "关闭状态下 mark 不应写入 note"
+        assert len(disp_after.rollback_history) == 0, \
+            "关闭状态下不应有回滚历史"
+        print("  关闭下操作均无副作用 (status/reviewer/note/history 未变): OK")
+
+        out_csv = os.path.join(tmpdir, "closed_export.csv")
+        r = runner.invoke(cli, ["export", "-b", batch_id, "-o", out_csv])
+        check("export while closed (应允许)", r)
+        assert os.path.isfile(out_csv), "关闭状态下 export 应正常工作"
+        print("  关闭状态下 export 仍可用: OK (不受影响)")
+
+        r = runner.invoke(cli, ["resume", batch_id])
+        check("resume while closed (应允许)", r)
+        assert "状态: closed" in r.output, "resume 输出应显示 closed 状态"
+        print("  关闭状态下 resume 仍可用，状态显示为 closed: OK")
+
+        r = runner.invoke(cli, ["reopen", "-b", batch_id])
+        check("reopen", r)
+
+        r = runner.invoke(cli, ["mark", "-b", batch_id, "-d", first_disp_id,
+                              "-s", "confirmed", "-r", "reopen_tester", "-n", "reopen 后正常"])
+        check("mark after reopen (应成功)", r)
+        b_final = storage.load(batch_id)
+        disp_final = next(d for d in b_final.discrepancies if d.discrepancy_id == first_disp_id)
+        assert disp_final.status == DiscrepancyStatus.CONFIRMED
+        assert disp_final.reviewer == "reopen_tester"
+        print("  reopen 后 mark 正常工作: OK")
+
+        r = runner.invoke(cli, ["rollback", "-b", batch_id, "-d", first_disp_id])
+        check("rollback after reopen (应成功)", r)
+        print("  reopen 后 rollback 正常工作: OK")
+
+        print("[PASS] 场景3 (close 后 mark/rollback 拒绝) 通过\n")
+
+    finally:
+        if "BANK_RECONCILE_HOME" in os.environ:
+            del os.environ["BANK_RECONCILE_HOME"]
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+
 def main():
     try:
         test_parser()
@@ -696,6 +988,9 @@ def main():
         test_audit_cli_integration()
         test_audit_persistence()
         test_audit_retention_cleanup()
+        test_close_reopen_import_block()
+        test_xlsx_import_field_values()
+        test_close_block_mark_rollback_match()
         print("=" * 50)
         print("所有测试通过！")
         print("=" * 50)

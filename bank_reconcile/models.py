@@ -31,6 +31,12 @@ class DiscrepancyStatus(str, Enum):
     IGNORED = "ignored"
 
 
+class BatchStatus(str, Enum):
+    """批次状态."""
+    OPEN = "open"
+    CLOSED = "closed"
+
+
 @dataclass
 class Transaction:
     """交易记录 - 可追溯到源文件."""
@@ -157,6 +163,7 @@ class Batch:
     name: str
     created_at: str = field(default_factory=lambda: datetime.now().isoformat())
     updated_at: str = field(default_factory=lambda: datetime.now().isoformat())
+    status: BatchStatus = BatchStatus.OPEN
     rule_file: Optional[str] = None
     imported_files: List[ImportedFile] = field(default_factory=list)
     bank_txns: List[Transaction] = field(default_factory=list)
@@ -164,6 +171,30 @@ class Batch:
     adjustment_txns: List[Transaction] = field(default_factory=list)
     discrepancies: List[Discrepancy] = field(default_factory=list)
     exports: List[Dict[str, Any]] = field(default_factory=list)
+
+    @property
+    def is_closed(self) -> bool:
+        return self.status == BatchStatus.CLOSED
+
+    @property
+    def is_open(self) -> bool:
+        return self.status == BatchStatus.OPEN
+
+    def close(self) -> bool:
+        """关闭批次（归档）. 返回 True 表示状态发生了变化."""
+        if self.status == BatchStatus.CLOSED:
+            return False
+        self.status = BatchStatus.CLOSED
+        self.touch()
+        return True
+
+    def reopen(self) -> bool:
+        """重新打开批次. 返回 True 表示状态发生了变化."""
+        if self.status == BatchStatus.OPEN:
+            return False
+        self.status = BatchStatus.OPEN
+        self.touch()
+        return True
 
     @classmethod
     def create(cls, name: str) -> "Batch":
@@ -181,6 +212,7 @@ class Batch:
             "name": self.name,
             "created_at": self.created_at,
             "updated_at": self.updated_at,
+            "status": self.status.value,
             "rule_file": self.rule_file,
             "imported_files": [f.to_dict() for f in self.imported_files],
             "bank_txns": [t.to_dict() for t in self.bank_txns],
@@ -227,6 +259,7 @@ class Batch:
             name=data["name"],
             created_at=data.get("created_at", datetime.now().isoformat()),
             updated_at=data.get("updated_at", datetime.now().isoformat()),
+            status=BatchStatus(data.get("status", BatchStatus.OPEN.value)),
             rule_file=data.get("rule_file"),
             imported_files=[
                 ImportedFile(
