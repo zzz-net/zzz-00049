@@ -4677,6 +4677,437 @@ def test_claim_status_filter_and_release_history():
         shutil.rmtree(tmpdir, ignore_errors=True)
 
 
+# ============================================================
+# 回归测试 - ClaimService 直接调用 + 行为变更验证
+# ============================================================
+
+def test_claim_service_direct_batch_claim():
+    """回归R1: 通过 ClaimService 直接批量认领，验证服务层逻辑."""
+    print("=== 回归R1: ClaimService 直接批量认领 ===")
+    samples_dir = os.path.join(os.path.dirname(__file__), "samples")
+    tmpdir = tempfile.mkdtemp(prefix="bank_claim_svc_batch_")
+
+    try:
+        batch_id, disp_ids = _setup_claim_env(tmpdir, samples_dir)
+        from bank_reconcile.claim_service import ClaimService, BatchValidationError
+        svc = ClaimService(tmpdir)
+
+        bulk_ids = disp_ids[:3]
+        bulk_arg = ",".join(bulk_ids)
+        result = svc.do_take(batch_id, bulk_arg, "svc_alice", expires_hours=4, note="svc批量测试")
+
+        assert len(result.successes) == 3, f"应成功3条, 实际{len(result.successes)}"
+        assert result.batch_id == batch_id
+        assert result.claimant == "svc_alice"
+        assert len(result.audit_ids) >= 1, "应有审计记录"
+        for s in result.successes:
+            assert s.claimant == "svc_alice"
+            assert s.expires_at, "应设置过期时间"
+        print(f"  批量认领: {len(result.successes)} 条成功, 审计ID={result.audit_ids}")
+
+        from bank_reconcile.claim import ClaimStorage
+        claim_storage = ClaimStorage(tmpdir)
+        for did in bulk_ids:
+            curr = claim_storage.get_current(batch_id, did)
+            assert curr is not None and curr.claimant == "svc_alice"
+        print("  ClaimStorage 层校验: 一致 [OK]")
+
+        result_dup = svc.do_take(batch_id, bulk_arg, "svc_alice")
+        assert len(result_dup.successes) == 0, f"同认领人重复应0成功, 实际{len(result_dup.successes)}"
+        assert len(result_dup.failures) == 3, f"同认领人重复应3失败, 实际{len(result_dup.failures)}"
+        for f in result_dup.failures:
+            assert "重复提交" in f["reason"], f"应提示重复提交, 实际: {f['reason']}"
+        print("  同认领人重复认领: 全部被拒绝 [OK]")
+
+        print("[PASS] 回归R1 (ClaimService 直接批量认领) 通过\n")
+
+    finally:
+        if "BANK_RECONCILE_HOME" in os.environ:
+            del os.environ["BANK_RECONCILE_HOME"]
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+
+def test_claim_service_cross_restart_persistence():
+    """回归R2: ClaimService 跨重启持久化验证."""
+    print("=== 回归R2: ClaimService 跨重启持久化 ===")
+    samples_dir = os.path.join(os.path.dirname(__file__), "samples")
+    tmpdir = tempfile.mkdtemp(prefix="bank_claim_svc_persist_")
+
+    try:
+        batch_id, disp_ids = _setup_claim_env(tmpdir, samples_dir)
+        from bank_reconcile.claim_service import ClaimService
+        from bank_reconcile.claim import ClaimStorage, ClaimStatus
+
+        svc1 = ClaimService(tmpdir)
+        result = svc1.do_take(batch_id, disp_ids[0], "persist_user", note="R2持久化")
+        assert len(result.successes) == 1
+
+        del svc1
+        svc2 = ClaimService(tmpdir)
+        list_result = svc2.do_list(batch_id=batch_id, claimant="persist_user")
+        claimed = [r for r in list_result.records if r.status == ClaimStatus.CLAIMED and r.claimant == "persist_user"]
+        assert len(claimed) >= 1, "重启后应能查到认领记录"
+        print(f"  实例2查询: {len(claimed)} 条 claimed 记录 [OK]")
+
+        claim_storage = ClaimStorage(tmpdir)
+        curr = claim_storage.get_current(batch_id, disp_ids[0])
+        assert curr is not None and curr.claimant == "persist_user"
+        print("  ClaimStorage 层持久化验证: [OK]")
+
+        print("[PASS] 回归R2 (跨重启持久化) 通过\n")
+
+    finally:
+        if "BANK_RECONCILE_HOME" in os.environ:
+            del os.environ["BANK_RECONCILE_HOME"]
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+
+def test_claim_service_real_cli_invocation():
+    """回归R3: 真实 CLI 命令调用走同一套 ClaimService 逻辑."""
+    print("=== 回归R3: CLI 与 ClaimService 走同一逻辑 ===")
+    samples_dir = os.path.join(os.path.dirname(__file__), "samples")
+    tmpdir = tempfile.mkdtemp(prefix="bank_claim_svc_cli_")
+
+    try:
+        batch_id, disp_ids = _setup_claim_env(tmpdir, samples_dir)
+        from click.testing import CliRunner
+        from bank_reconcile.cli import cli
+        from bank_reconcile.claim_service import ClaimService
+        from bank_reconcile.claim import ClaimStorage
+
+        runner = CliRunner()
+        r = runner.invoke(cli, [
+            "claim", "take", "-b", batch_id, "-d", disp_ids[0],
+            "-u", "cli_user", "-n", "CLI调用"
+        ])
+        assert r.exit_code == 0, f"CLI take 应成功: {r.output}"
+        assert "成功认领" in r.output
+        print("  CLI take: 成功")
+
+        svc = ClaimService(tmpdir)
+        list_result = svc.do_list(batch_id=batch_id, claimant="cli_user")
+        claimed_via_svc = [r for r in list_result.records if r.claimant == "cli_user"]
+        assert len(claimed_via_svc) >= 1, "ClaimService 应查到 CLI 创建的认领"
+        print("  ClaimService 查到 CLI 创建的认领: [OK]")
+
+        claim_storage = ClaimStorage(tmpdir)
+        curr = claim_storage.get_current(batch_id, disp_ids[0])
+        assert curr is not None and curr.claimant == "cli_user"
+        print("  ClaimStorage 层一致: [OK]")
+
+        r = runner.invoke(cli, [
+            "claim", "take", "-b", batch_id, "-d", disp_ids[0],
+            "-u", "cli_user"
+        ])
+        assert r.exit_code == 0, f"重复认领应返回0(有部分失败): {r.output}"
+        assert "重复提交" in r.output or "失败" in r.output
+        print("  CLI 同认领人重复认领被拒绝: [OK]")
+
+        print("[PASS] 回归R3 (CLI与ClaimService走同一逻辑) 通过\n")
+
+    finally:
+        if "BANK_RECONCILE_HOME" in os.environ:
+            del os.environ["BANK_RECONCILE_HOME"]
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+
+def test_claim_export_conflict_no_overwrite():
+    """回归R4: 导出到已存在文件直接失败，不能悄悄覆盖."""
+    print("=== 回归R4: 导出冲突 - 文件已存在直接失败 ===")
+    samples_dir = os.path.join(os.path.dirname(__file__), "samples")
+    tmpdir = tempfile.mkdtemp(prefix="bank_claim_export_conflict_")
+
+    try:
+        batch_id, disp_ids = _setup_claim_env(tmpdir, samples_dir)
+        from bank_reconcile.claim_service import ClaimService, ExportPathConflictError
+
+        svc = ClaimService(tmpdir)
+        svc.do_take(batch_id, disp_ids[0], "export_user")
+
+        json_out = os.path.join(tmpdir, "claims_conflict.json")
+        result1 = svc.do_export(json_out, "json", batch_id=batch_id)
+        assert result1.count > 0
+        assert os.path.isfile(json_out)
+        with open(json_out, "r", encoding="utf-8") as f:
+            content1 = json.load(f)
+        print(f"  首次导出: {result1.count} 条 -> {json_out}")
+
+        try:
+            svc.do_export(json_out, "json", batch_id=batch_id)
+            assert False, "导出到已存在文件应抛 ExportPathConflictError"
+        except ExportPathConflictError as e:
+            assert "已存在" in str(e), f"错误信息应含'已存在', 实际: {e}"
+            print(f"  重复导出被拒绝: {e}")
+
+        with open(json_out, "r", encoding="utf-8") as f:
+            content2 = json.load(f)
+        assert content1 == content2, "文件内容不应被覆盖"
+        print("  文件未被覆盖: [OK]")
+
+        csv_out = os.path.join(tmpdir, "claims_conflict.csv")
+        svc.do_export(csv_out, "csv", batch_id=batch_id)
+        try:
+            svc.do_export(csv_out, "csv", batch_id=batch_id)
+            assert False, "CSV导出到已存在文件应抛 ExportPathConflictError"
+        except ExportPathConflictError:
+            pass
+        print("  CSV 重复导出也被拒绝: [OK]")
+
+        from click.testing import CliRunner
+        from bank_reconcile.cli import cli
+        runner = CliRunner()
+        r = runner.invoke(cli, [
+            "claim", "export", "-b", batch_id, "-o", json_out, "-f", "json"
+        ])
+        assert r.exit_code != 0, "CLI 导出到已存在文件应失败"
+        assert "冲突" in r.output or "已存在" in r.output
+        print("  CLI 导出冲突: exit!=0 且提示冲突 [OK]")
+
+        print("[PASS] 回归R4 (导出冲突不覆盖) 通过\n")
+
+    finally:
+        if "BANK_RECONCILE_HOME" in os.environ:
+            del os.environ["BANK_RECONCILE_HOME"]
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+
+def test_claim_permission_boundary():
+    """回归R5: 认领权限边界 - 他人认领不能释放/标记，归档批次不能认领."""
+    print("=== 回归R5: 认领权限边界 ===")
+    samples_dir = os.path.join(os.path.dirname(__file__), "samples")
+    tmpdir = tempfile.mkdtemp(prefix="bank_claim_perm_bound_")
+
+    try:
+        batch_id, disp_ids = _setup_claim_env(tmpdir, samples_dir)
+        from bank_reconcile.claim_service import ClaimService, BatchValidationError
+        from bank_reconcile.claim import ClaimPermissionDeniedError
+
+        svc = ClaimService(tmpdir)
+        svc.do_take(batch_id, disp_ids[0], "owner_perm")
+
+        release_result = svc.do_release(batch_id, disp_ids[0], "stranger_perm")
+        assert len(release_result.failures) >= 1, "非认领人释放应失败"
+        assert any("认领" in f["reason"] for f in release_result.failures)
+        print("  非认领人释放: 被拒绝 [OK]")
+
+        from click.testing import CliRunner
+        from bank_reconcile.cli import cli
+        runner = CliRunner()
+        r = runner.invoke(cli, [
+            "mark", "-b", batch_id, "-d", disp_ids[0],
+            "-s", "confirmed", "-r", "stranger_perm"
+        ])
+        assert r.exit_code == 1
+        assert "认领" in r.output
+        print("  非认领人标记: 被拒绝 [OK]")
+
+        from bank_reconcile.storage import BatchStorage
+        storage = BatchStorage(tmpdir)
+        batch = storage.load(batch_id)
+        batch.status = "archived"
+        import json as _json
+        batch_path = os.path.join(tmpdir, "batches", f"{batch_id}.json")
+        archive_path = os.path.join(tmpdir, "archive", f"{batch_id}.json")
+        os.makedirs(os.path.dirname(archive_path), exist_ok=True)
+        with open(batch_path, "r", encoding="utf-8") as f:
+            data = _json.load(f)
+        data["status"] = "archived"
+        with open(archive_path, "w", encoding="utf-8") as f:
+            _json.dump(data, f, ensure_ascii=False, indent=2)
+        os.remove(batch_path)
+
+        try:
+            svc2 = ClaimService(tmpdir)
+            svc2.do_take(batch_id, disp_ids[1], "archived_user")
+            assert False, "归档批次认领应抛 BatchValidationError"
+        except BatchValidationError as e:
+            assert "归档" in str(e) or "archived" in str(e).lower()
+            print("  归档批次认领: 被拒绝 [OK]")
+
+        print("[PASS] 回归R5 (权限边界) 通过\n")
+
+    finally:
+        if "BANK_RECONCILE_HOME" in os.environ:
+            del os.environ["BANK_RECONCILE_HOME"]
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+
+def test_claim_audit_log_fields_stable():
+    """回归R6: 认领/释放/导出三条链路的审计日志字段稳定性."""
+    print("=== 回归R6: 审计日志字段稳定性 ===")
+    samples_dir = os.path.join(os.path.dirname(__file__), "samples")
+    tmpdir = tempfile.mkdtemp(prefix="bank_claim_audit_stable_")
+
+    try:
+        batch_id, disp_ids = _setup_claim_env(tmpdir, samples_dir)
+        from bank_reconcile.claim_service import ClaimService
+        from bank_reconcile.audit import AuditStorage
+
+        svc = ClaimService(tmpdir)
+        take_result = svc.do_take(batch_id, disp_ids[0], "audit_user", note="R6审计")
+        release_result = svc.do_release(batch_id, disp_ids[0], "audit_user", reason="R6释放")
+
+        json_out = os.path.join(tmpdir, "audit_stable.json")
+        export_result = svc.do_export(json_out, "json", batch_id=batch_id)
+
+        audit = AuditStorage(tmpdir)
+        take_logs = audit.query(batch_id=batch_id, op_type="claim_take")
+        release_logs = audit.query(batch_id=batch_id, op_type="claim_release")
+        export_logs = audit.query(batch_id=batch_id, op_type="claim_export")
+        fail_logs = audit.query(batch_id=batch_id, op_type="claim_take_fail")
+
+        for logs, label in [
+            (take_logs, "claim_take"),
+            (release_logs, "claim_release"),
+            (export_logs, "claim_export"),
+        ]:
+            assert len(logs) >= 1, f"{label} 审计记录应存在"
+            rec = logs[0]
+            required_fields = ["id", "timestamp", "command", "batch_id", "affected", "summary"]
+            for field in required_fields:
+                assert field in rec, f"{label} 审计记录缺少字段: {field}"
+            assert rec["command"] == label
+            assert rec["batch_id"] == batch_id
+            assert isinstance(rec["affected"], int)
+            assert isinstance(rec["summary"], str) and len(rec["summary"]) > 0
+        print(f"  claim_take: {len(take_logs)} 条, 字段完整")
+        print(f"  claim_release: {len(release_logs)} 条, 字段完整")
+        print(f"  claim_export: {len(export_logs)} 条, 字段完整")
+
+        assert len(take_result.audit_ids) >= 1, "take_result 应有审计ID"
+        assert len(export_result.audit_ids) >= 1, "export_result 应有审计ID"
+        print(f"  take audit_ids: {take_result.audit_ids}")
+        print(f"  export audit_ids: {export_result.audit_ids}")
+
+        for logs, label in [(take_logs, "claim_take"), (release_logs, "claim_release"), (export_logs, "claim_export")]:
+            rec = logs[0]
+            assert rec["timestamp"], "timestamp 不应为空"
+            assert len(rec["timestamp"]) >= 19, "timestamp 应为 ISO 格式"
+        print("  时间戳格式稳定: [OK]")
+
+        svc.do_take(batch_id, disp_ids[1], "audit_user2")
+        svc.do_take(batch_id, disp_ids[1], "audit_user2")
+        dup_fail_logs = audit.query(batch_id=batch_id, op_type="claim_take_fail")
+        assert len(dup_fail_logs) >= 1, "重复认领失败应有审计"
+        assert "重复提交" in dup_fail_logs[-1]["summary"]
+        print("  重复认领失败审计: [OK]")
+
+        print("[PASS] 回归R6 (审计日志字段稳定性) 通过\n")
+
+    finally:
+        if "BANK_RECONCILE_HOME" in os.environ:
+            del os.environ["BANK_RECONCILE_HOME"]
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+
+def test_claim_same_claimant_duplicate_blocked():
+    """回归R7: 同一认领人重复提交明确报错（行为变更验证）."""
+    print("=== 回归R7: 同一认领人重复提交明确报错 ===")
+    samples_dir = os.path.join(os.path.dirname(__file__), "samples")
+    tmpdir = tempfile.mkdtemp(prefix="bank_claim_same_dup_")
+
+    try:
+        batch_id, disp_ids = _setup_claim_env(tmpdir, samples_dir)
+        from bank_reconcile.claim_service import ClaimService
+        from bank_reconcile.claim import ClaimStorage
+
+        svc = ClaimService(tmpdir)
+        r1 = svc.do_take(batch_id, disp_ids[0], "same_user", note="首次认领")
+        assert len(r1.successes) == 1
+        assert len(r1.failures) == 0
+        print("  首次认领: 成功 [OK]")
+
+        r2 = svc.do_take(batch_id, disp_ids[0], "same_user", note="再次认领")
+        assert len(r2.successes) == 0, "同一认领人重复认领应0成功"
+        assert len(r2.failures) >= 1, "同一认领人重复认领应有失败"
+        found_dup = any("重复提交" in f["reason"] for f in r2.failures)
+        assert found_dup, f"失败原因应含'重复提交', 实际: {r2.failures}"
+        print("  同认领人重复: 失败且提示'重复提交' [OK]")
+
+        claim_storage = ClaimStorage(tmpdir)
+        curr = claim_storage.get_current(batch_id, disp_ids[0])
+        assert curr is not None and curr.claimant == "same_user"
+        assert curr.note == "首次认领", "note 不应被第二次认领覆盖"
+        print("  原始认领记录未被覆盖: [OK]")
+
+        from click.testing import CliRunner
+        from bank_reconcile.cli import cli
+        runner = CliRunner()
+        r = runner.invoke(cli, [
+            "claim", "take", "-b", batch_id, "-d", disp_ids[0],
+            "-u", "same_user"
+        ])
+        assert r.exit_code == 0
+        assert "重复提交" in r.output
+        print("  CLI 同认领人重复认领: 提示'重复提交' [OK]")
+
+        print("[PASS] 回归R7 (同认领人重复提交报错) 通过\n")
+
+    finally:
+        if "BANK_RECONCILE_HOME" in os.environ:
+            del os.environ["BANK_RECONCILE_HOME"]
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+
+def test_claim_list_export_full_discrepancy_id():
+    """回归R8: 列表和导出保留完整差异编号，不截断."""
+    print("=== 回归R8: 列表和导出保留完整差异编号 ===")
+    samples_dir = os.path.join(os.path.dirname(__file__), "samples")
+    tmpdir = tempfile.mkdtemp(prefix="bank_claim_full_id_")
+
+    try:
+        batch_id, disp_ids = _setup_claim_env(tmpdir, samples_dir)
+        from bank_reconcile.claim_service import ClaimService
+        from click.testing import CliRunner
+        from bank_reconcile.cli import cli
+
+        svc = ClaimService(tmpdir)
+        svc.do_take(batch_id, ",".join(disp_ids[:2]), "full_id_user", note="完整ID测试备注较长内容")
+
+        json_out = os.path.join(tmpdir, "full_id.json")
+        svc.do_export(json_out, "json", batch_id=batch_id)
+        with open(json_out, "r", encoding="utf-8") as f:
+            json_data = json.load(f)
+        for claim in json_data["current_claims"]:
+            if claim.get("claimant") == "full_id_user":
+                assert len(claim["discrepancy_id"]) > 0
+                assert claim["discrepancy_id"].startswith("DISP-"), \
+                    f"差异ID应完整, 实际: {claim['discrepancy_id']}"
+                assert "..." not in claim["discrepancy_id"], \
+                    f"差异ID不应含截断标记, 实际: {claim['discrepancy_id']}"
+        print("  JSON 导出: 差异ID完整 [OK]")
+
+        csv_out = os.path.join(tmpdir, "full_id.csv")
+        svc.do_export(csv_out, "csv", batch_id=batch_id)
+        with open(csv_out, "r", encoding="utf-8-sig", newline="") as f:
+            reader = csv.DictReader(f)
+            for row in reader:
+                if row.get("claimant") == "full_id_user":
+                    assert row["discrepancy_id"].startswith("DISP-")
+                    assert "..." not in row["discrepancy_id"]
+        print("  CSV 导出: 差异ID完整 [OK]")
+
+        runner = CliRunner()
+        r = runner.invoke(cli, ["claim", "list", "-b", batch_id, "-u", "full_id_user"])
+        assert r.exit_code == 0
+        for did in disp_ids[:2]:
+            assert did in r.output, f"列表输出应包含完整差异ID {did}"
+        print("  CLI 列表: 差异ID完整 [OK]")
+
+        r2 = runner.invoke(cli, ["claim", "list", "-b", batch_id])
+        assert r2.exit_code == 0
+        long_note = "完整ID测试备注较长内容"
+        assert long_note in r2.output, "列表输出应包含完整备注，不截断"
+        print("  CLI 列表: 备注不截断 [OK]")
+
+        print("[PASS] 回归R8 (列表导出完整差异编号) 通过\n")
+
+    finally:
+        if "BANK_RECONCILE_HOME" in os.environ:
+            del os.environ["BANK_RECONCILE_HOME"]
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+
 def main():
     os.environ["COLUMNS"] = "200"
     try:
@@ -4732,6 +5163,14 @@ def main():
         test_claim_bulk_take_and_release_reclaim()
         test_claim_export_json_csv_consistency()
         test_claim_status_filter_and_release_history()
+        test_claim_service_direct_batch_claim()
+        test_claim_service_cross_restart_persistence()
+        test_claim_service_real_cli_invocation()
+        test_claim_export_conflict_no_overwrite()
+        test_claim_permission_boundary()
+        test_claim_audit_log_fields_stable()
+        test_claim_same_claimant_duplicate_blocked()
+        test_claim_list_export_full_discrepancy_id()
         print("=" * 50)
         print("所有测试通过！")
         print("=" * 50)

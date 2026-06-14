@@ -253,7 +253,10 @@ class ClaimStorage:
                     rec = self._get_or_create_record(conn, batch_id, disp_id)
                     if rec.status == ClaimStatus.CLAIMED:
                         if rec.claimant == claimant.strip():
-                            successes.append(rec)
+                            failures.append({
+                                "discrepancy_id": disp_id,
+                                "reason": f"您已认领该差异，请勿重复提交",
+                            })
                             continue
                         failures.append({
                             "discrepancy_id": disp_id,
@@ -518,7 +521,15 @@ class ClaimStorage:
         claimant: Optional[str] = None,
         status: Optional[ClaimStatus] = None,
     ) -> int:
-        """导出 JSON 交接清单."""
+        """导出 JSON 交接清单.
+
+        Raises:
+            ExportPathConflictError: 输出文件已存在
+        """
+        if os.path.isfile(output_path):
+            raise ExportPathConflictError(
+                f"导出路径冲突: 文件已存在 '{output_path}'，请指定新的输出路径"
+            )
         records = self.list(batch_id=batch_id, claimant=claimant, status=status)
         history = self.list_history(batch_id=batch_id)
         data = {
@@ -551,7 +562,15 @@ class ClaimStorage:
         claimant: Optional[str] = None,
         status: Optional[ClaimStatus] = None,
     ) -> int:
-        """导出 CSV 交接清单（当前认领记录）."""
+        """导出 CSV 交接清单（当前认领记录）.
+
+        Raises:
+            ExportPathConflictError: 输出文件已存在
+        """
+        if os.path.isfile(output_path):
+            raise ExportPathConflictError(
+                f"导出路径冲突: 文件已存在 '{output_path}'，请指定新的输出路径"
+            )
         records = self.list(batch_id=batch_id, claimant=claimant, status=status)
         columns = [
             "claim_id", "batch_id", "discrepancy_id", "claimant",

@@ -70,6 +70,15 @@ from .claim import (
     ExportPathConflictError,
     ClaimPermissionDeniedError,
 )
+from .claim_service import (
+    ClaimService,
+    ClaimTakeResult,
+    ClaimReleaseResult,
+    ClaimListResult,
+    ClaimExportResult,
+    BatchValidationError,
+    DiscrepancyValidationError,
+)
 
 
 console = Console(highlight=False, emoji=False, markup=True)
@@ -86,6 +95,11 @@ def _get_audit(storage: BatchStorage) -> AuditStorage:
 
 def _get_claim(storage: BatchStorage) -> ClaimStorage:
     return ClaimStorage(storage.storage_dir)
+
+
+def _get_claim_service() -> ClaimService:
+    storage_dir = os.environ.get("BANK_RECONCILE_HOME")
+    return ClaimService(storage_dir)
 
 
 def _maybe_cleanup_audit(audit: AuditStorage, storage: BatchStorage) -> None:
@@ -1427,31 +1441,124 @@ def undo(batch_id: str) -> None:
     console.print(f"  操作时间: {last_entry['timestamp']}")
 
 
-def _validate_discrepancy_ids_in_batch(batch: Batch, discrepancy_ids: List[str]) -> Tuple[List[str], List[Dict[str, Any]]]:
-    """校验差异ID是否存在于批次中，返回(有效ID列表, 失败列表)."""
-    existing = {d.discrepancy_id for d in batch.discrepancies}
-    valid: List[str] = []
-    invalid: List[Dict[str, Any]] = []
-    for did in discrepancy_ids:
-        did = did.strip()
-        if not did:
-            continue
-        if did in existing:
-            valid.append(did)
-        else:
-            invalid.append({"discrepancy_id": did, "reason": "差异不存在于该批次"})
-    return valid, invalid
-
-
-def _parse_id_list(raw: str) -> List[str]:
-    """解析逗号分隔的ID列表."""
-    return [s.strip() for s in raw.split(",") if s.strip()]
-
-
 # ── claim group (list/take/release/export) ────────────────
 @cli.group("claim", help="差异认领工作台: 多人协作认领、释放、导出交接清单")
 def claim_group() -> None:
     pass
+
+
+_STATUS_STYLE_MAP = {
+    ClaimStatus.PENDING.value: "dim",
+    ClaimStatus.CLAIMED.value: "green",
+    ClaimStatus.RELEASED.value: "yellow",
+}
+
+
+def _render_claim_list(result: ClaimListResult) -> None:
+    if not result.records:
+        console.print("[yellow]无符合条件的认领记录[/]")
+        return
+
+    table = Table(
+        title=f"认领记录（共 {result.total_count} 条，"
+              f"显示前 {len(result.display_records)} 条）"
+    )
+    table.add_column("认领ID", style="cyan", overflow="fold")
+    table.add_column("批次ID", style="bold")
+    table.add_column("差异ID", style="green", overflow="fold")
+    table.add_column("认领人", style="magenta")
+    table.add_column("状态", style="yellow")
+    table.add_column("认领时间", style="dim")
+    table.add_column("过期时间", style="dim")
+    table.add_column("备注", style="dim", overflow="fold")
+
+    for r in result.display_records:
+        status_style = _STATUS_STYLE_MAP.get(r.status.value, "")
+        status_text = f"[{status_style}]{r.status.value}[/]" if status_style else r.status.value
+        table.add_row(
+            r.claim_id,
+            r.batch_id,
+            r.discrepancy_id,
+            r.claimant or "-",
+            status_text,
+            r.claimed_at[:19].replace("T", " ") if r.claimed_at else "-",
+            r.expires_at[:19].replace("T", " ") if r.expires_at else "-",
+            r.note,
+        )
+    console.print(table)
+
+    if result.by_status:
+        sum_table = Table(title="认领汇总 - 按状态")
+        sum_table.add_column("状态", style="bold")
+        sum_table.add_column("数量", justify="right")
+        for s, c in sorted(result.by_status.items()):
+            st = _STATUS_STYLE_MAP.get(s, "")
+            sum_table.add_row(f"[{st}]{s}[/]" if st else s, str(c))
+        console.print(sum_table)
+
+    if result.by_claimant:
+        uc_table = Table(title="认领汇总 - 按认领人")
+        uc_table.add_column("认领人", style="bold")
+        uc_table.add_column("数量", justify="right")
+        for u, c in sorted(result.by_claimant.items()):
+            uc_table.add_row(u, str(c))
+        console.print(uc_table)
+
+
+def _render_claim_take(result: ClaimTakeResult) -> None:
+    if result.successes:
+        console.print(f"[green]OK[/] 成功认领 [bold]{len(result.successes)}[/] 条差异:")
+        table = Table(title="成功认领清单")
+        table.add_column("差异ID", style="green")
+        table.add_column("认领人", style="magenta")
+        table.add_column("过期时间", style="yellow")
+        table.add_column("备注", style="dim", overflow="fold")
+        for s in result.successes:
+            table.add_row(
+                s.discrepancy_id,
+                s.claimant,
+                s.expires_at[:19].replace("T", " ") if s.expires_at else "永不过期",
+                s.note,
+            )
+        console.print(table)
+
+    if result.failures:
+        console.print(f"[yellow]WARN[/] 失败 [bold]{len(result.failures)}[/] 条:")
+        table = Table(title="失败清单")
+        table.add_column("差异ID", style="red")
+        table.add_column("失败原因", style="yellow")
+        for f in result.failures:
+            table.add_row(f["discrepancy_id"], f["reason"])
+        console.print(table)
+
+
+def _render_claim_release(result: ClaimReleaseResult) -> None:
+    release_type = "[magenta]管理员强制释放[/]" if result.force else "[green]本人释放[/]"
+
+    if result.successes:
+        console.print(f"[green]OK[/] {release_type}成功 [bold]{len(result.successes)}[/] 条差异:")
+        table = Table(title="释放成功清单")
+        table.add_column("差异ID", style="green")
+        table.add_column("原认领人", style="magenta")
+        table.add_column("释放方式", style="yellow")
+        table.add_column("释放原因", style="dim", overflow="fold")
+        for s in result.successes:
+            table.add_row(
+                s.discrepancy_id,
+                s.claimant or "-",
+                "强制释放" if s.is_force_release else "本人释放",
+                s.release_reason or "-",
+            )
+        console.print(table)
+
+    if result.failures:
+        console.print(f"[yellow]WARN[/] 失败 [bold]{len(result.failures)}[/] 条:")
+        table = Table(title="失败清单")
+        table.add_column("差异ID", style="red")
+        table.add_column("失败原因", style="yellow")
+        for f in result.failures:
+            table.add_row(f["discrepancy_id"], f["reason"])
+        console.print(table)
 
 
 @claim_group.command("list", help="按批次/处理人/状态筛选认领记录")
@@ -1467,96 +1574,18 @@ def claim_list(
     status: Optional[str],
     limit: int,
 ) -> None:
-    storage = _get_storage()
-    claim = _get_claim(storage)
-
-    if batch_id and not storage.batch_exists_anywhere(batch_id):
-        console.print(f"[red]ERR[/] 批次不存在: {batch_id}")
-        audit = _get_audit(storage)
-        audit.log("claim_list_fail", batch_id or "ALL", 0, f"列表查询失败: 批次不存在 {batch_id}")
+    svc = _get_claim_service()
+    status_enum = ClaimStatus(status) if status else None
+    try:
+        result = svc.do_list(
+            batch_id=batch_id, claimant=claimant,
+            status=status_enum, limit=limit,
+        )
+    except BatchValidationError as e:
+        console.print(f"[red]ERR[/] {e}")
         sys.exit(1)
 
-    if batch_id and storage.batch_exists(batch_id):
-        batch = storage.load(batch_id)
-        all_disp_ids = [d.discrepancy_id for d in batch.discrepancies]
-        claim.ensure_pending_for_batch(batch_id, all_disp_ids)
-
-    status_enum = ClaimStatus(status) if status else None
-    records = claim.list(batch_id=batch_id, claimant=claimant, status=status_enum)
-
-    if not records:
-        console.print("[yellow]无符合条件的认领记录[/]")
-        audit = _get_audit(storage)
-        audit.log(
-            "claim_list", batch_id or "ALL", 0,
-            f"查询认领记录: 批次={batch_id or '全部'}, 认领人={claimant or '全部'}, 状态={status or '全部'}, 结果=0条"
-        )
-        return
-
-    display_records = records[:limit]
-
-    table = Table(title=f"认领记录（共 {len(records)} 条，显示前 {len(display_records)} 条）")
-    table.add_column("认领ID", style="cyan", overflow="fold")
-    table.add_column("批次ID", style="bold")
-    table.add_column("差异ID", style="green", overflow="fold")
-    table.add_column("认领人", style="magenta")
-    table.add_column("状态", style="yellow")
-    table.add_column("认领时间", style="dim")
-    table.add_column("过期时间", style="dim")
-    table.add_column("备注", style="dim", overflow="fold")
-
-    status_style_map = {
-        ClaimStatus.PENDING.value: "dim",
-        ClaimStatus.CLAIMED.value: "green",
-        ClaimStatus.RELEASED.value: "yellow",
-    }
-
-    for r in display_records:
-        status_style = status_style_map.get(r.status.value, "")
-        status_text = f"[{status_style}]{r.status.value}[/]" if status_style else r.status.value
-        table.add_row(
-            r.claim_id,
-            r.batch_id,
-            r.discrepancy_id,
-            r.claimant or "-",
-            status_text,
-            r.claimed_at[:19].replace("T", " ") if r.claimed_at else "-",
-            r.expires_at[:19].replace("T", " ") if r.expires_at else "-",
-            r.note[:30] + ("..." if len(r.note) > 30 else ""),
-        )
-    console.print(table)
-
-    summary_rows = []
-    by_status: Dict[str, int] = {}
-    by_claimant: Dict[str, int] = {}
-    for r in records:
-        by_status[r.status.value] = by_status.get(r.status.value, 0) + 1
-        if r.claimant:
-            by_claimant[r.claimant] = by_claimant.get(r.claimant, 0) + 1
-
-    if by_status:
-        sum_table = Table(title="认领汇总 - 按状态")
-        sum_table.add_column("状态", style="bold")
-        sum_table.add_column("数量", justify="right")
-        for s, c in sorted(by_status.items()):
-            st = status_style_map.get(s, "")
-            sum_table.add_row(f"[{st}]{s}[/]" if st else s, str(c))
-        console.print(sum_table)
-
-    if by_claimant:
-        uc_table = Table(title="认领汇总 - 按认领人")
-        uc_table.add_column("认领人", style="bold")
-        uc_table.add_column("数量", justify="right")
-        for u, c in sorted(by_claimant.items()):
-            uc_table.add_row(u, str(c))
-        console.print(uc_table)
-
-    audit = _get_audit(storage)
-    audit.log(
-        "claim_list", batch_id or "ALL", len(records),
-        f"查询认领记录: 批次={batch_id or '全部'}, 认领人={claimant or '全部'}, 状态={status or '全部'}, 共 {len(records)} 条"
-    )
-    _maybe_cleanup_audit(audit, storage)
+    _render_claim_list(result)
 
 
 @claim_group.command("take", help="批量认领差异，支持过期时间和备注")
@@ -1574,89 +1603,29 @@ def claim_take(
     expires_hours: Optional[int],
     note: str,
 ) -> None:
-    storage = _get_storage()
-    audit = _get_audit(storage)
-
-    if not storage.batch_exists_anywhere(batch_id):
-        console.print(f"[red]ERR[/] 批次不存在: {batch_id}")
-        audit.log("claim_take_fail", batch_id, 0, f"认领失败: 批次不存在 {batch_id}")
-        sys.exit(1)
-
-    batch = storage.load(batch_id)
-    if batch.is_closed:
-        console.print(f"[red]ERR[/] 批次已关闭（closed），禁止认领。请先 reopen 后再操作。")
-        audit.log("claim_take_fail", batch_id, 0, "认领失败: 批次已关闭")
-        sys.exit(1)
-    _check_archived_write_block(batch, "认领")
-
-    disp_ids = _parse_id_list(discrepancy_ids)
-    if not disp_ids:
-        console.print("[red]ERR[/] 请提供至少一个有效的差异ID")
-        audit.log("claim_take_fail", batch_id, 0, "认领失败: 未提供差异ID")
-        sys.exit(1)
-
-    valid_ids, invalid = _validate_discrepancy_ids_in_batch(batch, disp_ids)
-
-    if not valid_ids:
-        console.print("[red]ERR[/] 没有有效的差异ID:")
-        for f in invalid:
-            console.print(f"  - {f['discrepancy_id']}: {f['reason']}")
-        audit.log(
-            "claim_take_fail", batch_id, 0,
-            f"认领失败: 无有效差异ID, 认领人 {claimant}"
-        )
-        sys.exit(1)
-
-    claim = _get_claim(storage)
+    svc = _get_claim_service()
     try:
-        successes, failures = claim.take(
-            batch_id, valid_ids, claimant, expires_hours=expires_hours, note=note
+        result = svc.do_take(
+            batch_id=batch_id,
+            discrepancy_ids_raw=discrepancy_ids,
+            claimant=claimant,
+            expires_hours=expires_hours,
+            note=note,
         )
+    except BatchValidationError as e:
+        console.print(f"[red]ERR[/] {e}")
+        sys.exit(1)
+    except DiscrepancyValidationError as e:
+        console.print(f"[red]ERR[/] {e}")
+        sys.exit(1)
     except OperatorMissingError as e:
         console.print(f"[red]ERR[/] {e}")
-        audit.log("claim_take_fail", batch_id, 0, f"认领失败: {e}")
+        sys.exit(1)
+    except ClaimError as e:
+        console.print(f"[red]ERR[/] {e}")
         sys.exit(1)
 
-    all_failures = invalid + failures
-
-    if successes:
-        console.print(f"[green]OK[/] 成功认领 [bold]{len(successes)}[/] 条差异:")
-        table = Table(title="成功认领清单")
-        table.add_column("差异ID", style="green")
-        table.add_column("认领人", style="magenta")
-        table.add_column("过期时间", style="yellow")
-        table.add_column("备注", style="dim", overflow="fold")
-        for s in successes:
-            table.add_row(
-                s.discrepancy_id,
-                s.claimant,
-                s.expires_at[:19].replace("T", " ") if s.expires_at else "永不过期",
-                s.note[:40] + ("..." if len(s.note) > 40 else ""),
-            )
-        console.print(table)
-        success_ids = ",".join(s.discrepancy_id for s in successes)
-        audit.log(
-            "claim_take", batch_id, len(successes),
-            f"成功认领 {len(successes)} 条: {success_ids}, 认领人 {claimant}"
-            + (f", 过期 {expires_hours}h" if expires_hours else "")
-            + (f", 备注: {note}" if note else "")
-        )
-
-    if all_failures:
-        console.print(f"[yellow]WARN[/] 失败 [bold]{len(all_failures)}[/] 条:")
-        table = Table(title="失败清单")
-        table.add_column("差异ID", style="red")
-        table.add_column("失败原因", style="yellow")
-        for f in all_failures:
-            table.add_row(f["discrepancy_id"], f["reason"])
-        console.print(table)
-        fail_ids = ",".join(f"{f['discrepancy_id']}({f['reason']})" for f in all_failures)
-        audit.log(
-            "claim_take_fail", batch_id, len(all_failures),
-            f"认领失败 {len(all_failures)} 条: {fail_ids}, 认领人 {claimant}"
-        )
-
-    _maybe_cleanup_audit(audit, storage)
+    _render_claim_take(result)
 
 
 @claim_group.command("release", help="释放认领（本人释放 / 管理员 --force 强制释放）")
@@ -1674,91 +1643,26 @@ def claim_release(
     reason: str,
     force: bool,
 ) -> None:
-    storage = _get_storage()
-    audit = _get_audit(storage)
-
-    if not storage.batch_exists_anywhere(batch_id):
-        console.print(f"[red]ERR[/] 批次不存在: {batch_id}")
-        audit.log("claim_release_fail", batch_id, 0, f"释放失败: 批次不存在 {batch_id}")
-        sys.exit(1)
-
-    batch = storage.load(batch_id)
-    if batch.is_closed:
-        console.print(f"[red]ERR[/] 批次已关闭（closed），禁止释放。请先 reopen 后再操作。")
-        audit.log("claim_release_fail", batch_id, 0, "释放失败: 批次已关闭")
-        sys.exit(1)
-    _check_archived_write_block(batch, "释放认领")
-
-    disp_ids = _parse_id_list(discrepancy_ids)
-    if not disp_ids:
-        console.print("[red]ERR[/] 请提供至少一个有效的差异ID")
-        audit.log("claim_release_fail", batch_id, 0, "释放失败: 未提供差异ID")
-        sys.exit(1)
-
-    valid_ids, invalid = _validate_discrepancy_ids_in_batch(batch, disp_ids)
-
-    if not valid_ids:
-        console.print("[red]ERR[/] 没有有效的差异ID:")
-        for f in invalid:
-            console.print(f"  - {f['discrepancy_id']}: {f['reason']}")
-        audit.log(
-            "claim_release_fail", batch_id, 0,
-            f"释放失败: 无有效差异ID, 操作人 {operator}"
-        )
-        sys.exit(1)
-
-    claim = _get_claim(storage)
+    svc = _get_claim_service()
     try:
-        successes, failures = claim.release(
-            batch_id, valid_ids, operator, reason=reason, force=force
+        result = svc.do_release(
+            batch_id=batch_id,
+            discrepancy_ids_raw=discrepancy_ids,
+            operator=operator,
+            reason=reason,
+            force=force,
         )
+    except BatchValidationError as e:
+        console.print(f"[red]ERR[/] {e}")
+        sys.exit(1)
+    except DiscrepancyValidationError as e:
+        console.print(f"[red]ERR[/] {e}")
+        sys.exit(1)
     except (OperatorMissingError, ClaimError) as e:
         console.print(f"[red]ERR[/] {e}")
-        audit.log("claim_release_fail", batch_id, 0, f"释放失败: {e}")
         sys.exit(1)
 
-    all_failures = invalid + failures
-
-    release_type = "[magenta]管理员强制释放[/]" if force else "[green]本人释放[/]"
-
-    if successes:
-        console.print(f"[green]OK[/] {release_type}成功 [bold]{len(successes)}[/] 条差异:")
-        table = Table(title="释放成功清单")
-        table.add_column("差异ID", style="green")
-        table.add_column("原认领人", style="magenta")
-        table.add_column("释放方式", style="yellow")
-        table.add_column("释放原因", style="dim", overflow="fold")
-        for s in successes:
-            table.add_row(
-                s.discrepancy_id,
-                s.claimant or "-",
-                "强制释放" if s.is_force_release else "本人释放",
-                s.release_reason[:40] + ("..." if len(s.release_reason) > 40 else "-"),
-            )
-        console.print(table)
-        success_ids = ",".join(s.discrepancy_id for s in successes)
-        cmd_type = "claim_release_force" if force else "claim_release"
-        audit.log(
-            cmd_type, batch_id, len(successes),
-            f"释放成功 {len(successes)} 条: {success_ids}, 操作人 {operator}"
-            f", 类型={'强制' if force else '本人'}" + (f", 原因: {reason}" if reason else "")
-        )
-
-    if all_failures:
-        console.print(f"[yellow]WARN[/] 失败 [bold]{len(all_failures)}[/] 条:")
-        table = Table(title="失败清单")
-        table.add_column("差异ID", style="red")
-        table.add_column("失败原因", style="yellow")
-        for f in all_failures:
-            table.add_row(f["discrepancy_id"], f["reason"])
-        console.print(table)
-        fail_ids = ",".join(f"{f['discrepancy_id']}({f['reason']})" for f in all_failures)
-        audit.log(
-            "claim_release_fail", batch_id, len(all_failures),
-            f"释放失败 {len(all_failures)} 条: {fail_ids}, 操作人 {operator}"
-        )
-
-    _maybe_cleanup_audit(audit, storage)
+    _render_claim_release(result)
 
 
 @claim_group.command("export", help="导出交接清单（JSON/CSV）")
@@ -1778,67 +1682,28 @@ def claim_export(
     output: str,
     fmt: str,
 ) -> None:
-    storage = _get_storage()
-    audit = _get_audit(storage)
-
-    if batch_id and not storage.batch_exists_anywhere(batch_id):
-        console.print(f"[red]ERR[/] 批次不存在: {batch_id}")
-        audit.log("claim_export_fail", batch_id or "ALL", 0, f"导出失败: 批次不存在 {batch_id}")
-        sys.exit(1)
-
-    abs_output = os.path.abspath(output)
-    if os.path.isdir(abs_output):
-        console.print(f"[red]ERR[/] 导出路径冲突: '{output}' 是一个目录，请指定文件路径")
-        audit.log("claim_export_fail", batch_id or "ALL", 0, f"导出失败: 路径是目录 {output}")
-        sys.exit(1)
-
-    out_dir = os.path.dirname(abs_output)
-    if out_dir and not os.path.isdir(out_dir):
-        try:
-            os.makedirs(out_dir, exist_ok=True)
-        except OSError as e:
-            console.print(f"[red]ERR[/] 导出目录创建失败: {e}")
-            audit.log("claim_export_fail", batch_id or "ALL", 0, f"导出失败: 目录创建失败 {e}")
-            sys.exit(1)
-
-    if os.path.isfile(abs_output):
-        console.print(
-            f"[yellow]WARN[/] 输出文件已存在: {abs_output}\n"
-            f"  内容将被覆盖。"
-        )
-
-    claim = _get_claim(storage)
+    svc = _get_claim_service()
     status_enum = ClaimStatus(status) if status else None
-
-    if batch_id and storage.batch_exists(batch_id):
-        batch = storage.load(batch_id)
-        all_disp_ids = [d.discrepancy_id for d in batch.discrepancies]
-        claim.ensure_pending_for_batch(batch_id, all_disp_ids)
-
     try:
-        if fmt == "json":
-            count = claim.export_json(abs_output, batch_id, claimant, status_enum)
-        else:
-            count = claim.export_csv(abs_output, batch_id, claimant, status_enum)
+        result = svc.do_export(
+            output=output, fmt=fmt,
+            batch_id=batch_id, claimant=claimant,
+            status=status_enum,
+        )
+    except BatchValidationError as e:
+        console.print(f"[red]ERR[/] {e}")
+        sys.exit(1)
+    except ExportPathConflictError as e:
+        console.print(f"[red]ERR[/] {e}")
+        sys.exit(1)
     except OSError as e:
         console.print(f"[red]ERR[/] 导出失败: {e}")
-        audit.log(
-            "claim_export_fail", batch_id or "ALL", 0,
-            f"导出失败: {e}, 路径 {output}"
-        )
         sys.exit(1)
 
     console.print(
-        f"[green]OK[/] 已导出 [bold]{count}[/] 条认领记录到 [cyan]{abs_output}[/]"
+        f"[green]OK[/] 已导出 [bold]{result.count}[/] 条认领记录到 [cyan]{result.output_path}[/]"
         f" (格式: {fmt.upper()})"
     )
-
-    audit.log(
-        "claim_export", batch_id or "ALL", count,
-        f"导出交接清单: {count} 条, 格式={fmt.upper()}, 路径={abs_output}"
-        f", 批次={batch_id or '全部'}, 认领人={claimant or '全部'}, 状态={status or '全部'}"
-    )
-    _maybe_cleanup_audit(audit, storage)
 
 
 # ── batch group (archive/restore/cleanup) ─────────────────
