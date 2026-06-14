@@ -3,6 +3,8 @@ import os
 import sys
 import shutil
 import tempfile
+import io
+from contextlib import redirect_stdout
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
@@ -22,13 +24,23 @@ def test_parser():
         os.path.join(samples_dir, "bank_statement.csv"),
         FileType.BANK_STATEMENT,
     )
-    print(f"银行回单: {result.row_count} 条有效记录, {len(result.errors)} 条错误")
+    print(f"银行回单: {result.row_count} 条有效记录, {len(result.errors)} 条错误, {len(result.duplicates)} 条重复")
     assert result.row_count > 0, "应该有有效记录"
     assert len(result.errors) >= 2, "应该有非法金额和缺少交易号的错误"
+    assert len(result.duplicates) >= 1, "parser 应填充 duplicates 列表（import 阶段告警）"
 
     error_types = {e.error_type for e in result.errors}
     assert "invalid_amount" in error_types, "应该有非法金额错误"
     assert "missing_txn_id" in error_types, "应该有缺少交易号错误"
+
+    dup_types = {d.error_type for d in result.duplicates}
+    assert "duplicate_txn_id" in dup_types, "应该有 duplicate_txn_id 类型的重复记录"
+    assert all(d.source_row > 0 for d in result.duplicates), "重复记录应包含 source_row"
+    print(f"  重复检测验证通过: 检测到 B002 重复出现在第 {result.duplicates[0].source_row} 行, {result.duplicates[0].message}")
+
+    bank_ids_from_txns = [t.txn_id for t in result.transactions]
+    assert bank_ids_from_txns.count("B002") >= 2, "重复流水仍要保留在 transactions 中供匹配阶段使用"
+    print("  重复记录同时保留在 transactions 中供匹配阶段使用: OK")
 
     result2, imported2 = parse_csv(
         os.path.join(samples_dir, "system_receipt.csv"),
@@ -297,6 +309,90 @@ def test_error_paths():
     print("[PASS] 失败路径测试通过\n")
 
 
+def test_cli_rich_output():
+    print("=== 测试 CLI Rich 输出格式 (无 MarkupError) ===")
+    samples_dir = os.path.join(os.path.dirname(__file__), "samples")
+    tmpdir = tempfile.mkdtemp(prefix="bank_reconcile_cli_")
+
+    try:
+        os.environ["BANK_RECONCILE_HOME"] = tmpdir
+
+        from click.testing import CliRunner
+        from bank_reconcile.cli import cli
+
+        runner = CliRunner()
+
+        def check(desc, result, expected_exit=0):
+            assert result.exit_code == expected_exit, f"[{desc}] 退出码 {result.exit_code}, 期望 {expected_exit}, stdout={result.output}\n exc_info={result.exception and str(result.exception)}"
+            if result.exception:
+                import traceback
+                tb = "".join(traceback.format_exception(type(result.exception), result.exception, result.exception.__traceback__))
+                raise AssertionError(f"[{desc}] 抛出异常: {result.exception}\n{tb}")
+            print(f"  [OK] {desc}: exit_code=0, 无异常栈")
+
+        r = runner.invoke(cli, ["create", "cli_rich_test"])
+        check("create", r)
+        batch_line = [ln for ln in r.output.splitlines() if "BATCH-" in ln][0]
+        batch_id = batch_line.split("(ID: ")[1].rstrip(")").strip()
+        print(f"    批次ID: {batch_id}")
+
+        r = runner.invoke(cli, ["import", "-b", batch_id, "-t", "bank",
+                            os.path.join(samples_dir, "bank_statement.csv")])
+        check("import bank", r)
+        assert "重复流水号" in r.output, "银行回单样例含 B002 重复，输出应包含'重复流水号'告警"
+        print("    import 阶段重复告警可见: YES")
+
+        r = runner.invoke(cli, ["import", "-b", batch_id, "-t", "system",
+                            os.path.join(samples_dir, "system_receipt.csv")])
+        check("import system", r)
+
+        r = runner.invoke(cli, ["import", "-b", batch_id, "-t", "adjustment",
+                            os.path.join(samples_dir, "manual_adjustment.csv")])
+        check("import adjustment", r)
+
+        r = runner.invoke(cli, ["rules", "-b", batch_id,
+                            os.path.join(samples_dir, "rules.yaml")])
+        check("rules", r)
+
+        r = runner.invoke(cli, ["match", "-b", batch_id])
+        check("match", r)
+
+        r = runner.invoke(cli, ["discrepancies", "-b", batch_id, "-n", "5"])
+        check("discrepancies", r)
+
+        storage2 = BatchStorage(tmpdir)
+        b = storage2.load(batch_id)
+        assert len(b.discrepancies) > 0, "match 后应存在差异"
+        first_disp_id = b.discrepancies[0].discrepancy_id
+        print(f"    首个差异ID: {first_disp_id}")
+
+        r = runner.invoke(cli, ["mark", "-b", batch_id, "-d", first_disp_id,
+                              "-s", "confirmed", "-r", "tester_alice", "-n", "测试备注"])
+        check("mark confirmed", r)
+
+        r = runner.invoke(cli, ["rollback", "-b", batch_id, "-d", first_disp_id])
+        check("rollback", r)
+
+        out_csv = os.path.join(tmpdir, "cli_test.csv")
+        r = runner.invoke(cli, ["export", "-b", batch_id, "-o", out_csv, "--with-summary"])
+        check("export", r)
+
+        assert os.path.isfile(out_csv), "CSV 报告应落盘"
+        summary_path = os.path.join(tmpdir, "cli_test_summary.csv")
+        assert os.path.isfile(summary_path), "摘要文件应落盘"
+        print(f"    报告落盘: CSV {out_csv}")
+
+        r = runner.invoke(cli, ["resume", batch_id])
+        check("resume", r)
+
+        print("[PASS] CLI Rich 输出格式测试通过\n")
+
+    finally:
+        if "BANK_RECONCILE_HOME" in os.environ:
+            del os.environ["BANK_RECONCILE_HOME"]
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+
 def main():
     try:
         test_parser()
@@ -305,6 +401,7 @@ def main():
         test_storage_and_lifecycle()
         test_source_traceability()
         test_error_paths()
+        test_cli_rich_output()
         print("=" * 50)
         print("所有测试通过！")
         print("=" * 50)

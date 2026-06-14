@@ -52,7 +52,7 @@ def create(name: str) -> None:
     storage = _get_storage()
     batch = Batch.create(name)
     storage.save(batch)
-    console.print(f"[green][OK][/] 批次已创建: [bold]{batch.name}[/] (ID: [cyan]{batch.batch_id}[/])")
+    console.print(f"[green]OK[/] 批次已创建: [bold]{batch.name}[/] (ID: [cyan]{batch.batch_id}[/])")
     console.print(f"  存储位置: {storage.batches_dir}")
 
 
@@ -95,7 +95,7 @@ def list_batches() -> None:
 def import_file(batch_id: str, file_type: str, file_path: str) -> None:
     storage = _get_storage()
     if not storage.batch_exists(batch_id):
-        console.print(f"[red][ERR][/] 批次不存在:[/] {batch_id}")
+        console.print(f"[red]ERR[/] 批次不存在: {batch_id}")
         sys.exit(1)
 
     batch = storage.load(batch_id)
@@ -110,10 +110,10 @@ def import_file(batch_id: str, file_type: str, file_path: str) -> None:
     try:
         result, imported = parse_csv(file_path, ft)
     except FileNotFoundError as e:
-        console.print(f"[red][ERR][/] {e}[/]")
+        console.print(f"[red]ERR[/] {e}")
         sys.exit(1)
     except ValueError as e:
-        console.print(f"[red][ERR][/] 解析失败:[/] {e}")
+        console.print(f"[red]ERR[/] 解析失败: {e}")
         sys.exit(1)
 
     if ft == FileType.BANK_STATEMENT:
@@ -136,16 +136,16 @@ def import_file(batch_id: str, file_type: str, file_path: str) -> None:
         FileType.MANUAL_ADJUSTMENT: "手工调整",
     }[ft]
 
-    console.print(f"[green][OK][/] 导入{type_name}文件成功[/]")
+    console.print(f"[green]OK[/] 导入{type_name}文件成功")
     console.print(f"  有效记录: {result.row_count} 条")
     if result.errors:
-        console.print(f"  [yellow]解析错误: {len(result.errors)} 条[/]")
+        console.print(f"  [yellow]解析错误: {len(result.errors)} 条")
         for e in result.errors[:5]:
             console.print(f"    - 第{e.source_row}行: {e.message}")
         if len(result.errors) > 5:
             console.print(f"    ... 还有 {len(result.errors) - 5} 条错误")
     if result.duplicates:
-        console.print(f"  [yellow]重复流水号: {len(result.duplicates)} 条[/]")
+        console.print(f"  [yellow]重复流水号: {len(result.duplicates)} 条")
         for d in result.duplicates[:5]:
             console.print(f"    - 第{d.source_row}行: {d.message}")
         if len(result.duplicates) > 5:
@@ -159,20 +159,20 @@ def import_file(batch_id: str, file_type: str, file_path: str) -> None:
 def rules(batch_id: str, rule_file: str) -> None:
     storage = _get_storage()
     if not storage.batch_exists(batch_id):
-        console.print(f"[red][ERR][/] 批次不存在:[/] {batch_id}")
+        console.print(f"[red]ERR[/] 批次不存在: {batch_id}")
         sys.exit(1)
 
     try:
         rules_obj = load_rules(rule_file)
     except RuleValidationError as e:
-        console.print(f"[red][ERR][/] 规则文件错误:[/] {e}")
+        console.print(f"[red]ERR[/] 规则文件错误: {e}")
         sys.exit(1)
 
     batch = storage.load(batch_id)
     batch.rule_file = os.path.abspath(rule_file)
     storage.save(batch)
 
-    console.print(f"[green][OK][/] 规则文件已设置[/]")
+    console.print(f"[green]OK[/] 规则文件已设置")
     console.print(f"  金额容差: {rules_obj.amount_tolerance}")
     console.print(f"  日期窗口: {rules_obj.date_window_days} 天")
     console.print(f"  人工复核关键词: {', '.join(rules_obj.manual_review_keywords)}")
@@ -185,7 +185,7 @@ def rules(batch_id: str, rule_file: str) -> None:
 def match(batch_id: str, rule_file: Optional[str]) -> None:
     storage = _get_storage()
     if not storage.batch_exists(batch_id):
-        console.print(f"[red][ERR][/] 批次不存在:[/] {batch_id}")
+        console.print(f"[red]ERR[/] 批次不存在: {batch_id}")
         sys.exit(1)
 
     batch = storage.load(batch_id)
@@ -194,14 +194,14 @@ def match(batch_id: str, rule_file: Optional[str]) -> None:
     try:
         rules_obj = load_rules(rule_path)
     except RuleValidationError as e:
-        console.print(f"[red][ERR][/] 规则文件错误:[/] {e}")
+        console.print(f"[red]ERR[/] 规则文件错误: {e}")
         sys.exit(1)
 
     if not batch.bank_txns:
-        console.print("[yellow][WARN][/] 尚未导入银行回单，跳过匹配[/]")
+        console.print("[yellow]WARN[/] 尚未导入银行回单，跳过匹配")
         return
     if not batch.system_txns:
-        console.print("[yellow][WARN][/] 尚未导入系统流水，跳过匹配[/]")
+        console.print("[yellow]WARN[/] 尚未导入系统流水，跳过匹配")
         return
 
     discrepancies = run_matching(batch, rules_obj)
@@ -215,7 +215,7 @@ def match(batch_id: str, rule_file: Optional[str]) -> None:
         t = d.discrepancy_type.value
         by_type[t] = by_type.get(t, 0) + 1
 
-    console.print(f"[green][OK][/] 匹配完成[/]，共发现 [bold]{len(discrepancies)}[/] 条差异")
+    console.print(f"[green]OK[/] 匹配完成，共发现 [bold]{len(discrepancies)}[/] 条差异")
     for t, c in sorted(by_type.items()):
         console.print(f"  {t}: {c}")
 
@@ -236,7 +236,7 @@ def match(batch_id: str, rule_file: Optional[str]) -> None:
 def list_discrepancies(batch_id: str, status: Optional[str], disp_type: Optional[str], limit: int) -> None:
     storage = _get_storage()
     if not storage.batch_exists(batch_id):
-        console.print(f"[red][ERR][/] 批次不存在:[/] {batch_id}")
+        console.print(f"[red]ERR[/] 批次不存在: {batch_id}")
         sys.exit(1)
 
     batch = storage.load(batch_id)
@@ -283,7 +283,7 @@ def list_discrepancies(batch_id: str, status: Optional[str], disp_type: Optional
 def mark(batch_id: str, discrepancy_id: str, status: str, reviewer: str, note: str) -> None:
     storage = _get_storage()
     if not storage.batch_exists(batch_id):
-        console.print(f"[red][ERR][/] 批次不存在:[/] {batch_id}")
+        console.print(f"[red]ERR[/] 批次不存在: {batch_id}")
         sys.exit(1)
 
     batch = storage.load(batch_id)
@@ -296,13 +296,13 @@ def mark(batch_id: str, discrepancy_id: str, status: str, reviewer: str, note: s
             break
 
     if not found:
-        console.print(f"[red][ERR][/] 差异不存在:[/] {discrepancy_id}")
+        console.print(f"[red]ERR[/] 差异不存在: {discrepancy_id}")
         sys.exit(1)
 
     found.mark(target_status, reviewer, note)
     storage.save(batch)
 
-    console.print(f"[green][OK][/] 已标记[/] {discrepancy_id} 为 [bold]{status}[/]")
+    console.print(f"[green]OK[/] 已标记 {discrepancy_id} 为 [bold]{status}[/]")
     console.print(f"  复核人: {reviewer}")
     if note:
         console.print(f"  备注: {note}")
@@ -315,7 +315,7 @@ def mark(batch_id: str, discrepancy_id: str, status: str, reviewer: str, note: s
 def rollback(batch_id: str, discrepancy_id: str) -> None:
     storage = _get_storage()
     if not storage.batch_exists(batch_id):
-        console.print(f"[red][ERR][/] 批次不存在:[/] {batch_id}")
+        console.print(f"[red]ERR[/] 批次不存在: {batch_id}")
         sys.exit(1)
 
     batch = storage.load(batch_id)
@@ -327,14 +327,14 @@ def rollback(batch_id: str, discrepancy_id: str) -> None:
             break
 
     if not found:
-        console.print(f"[red][ERR][/] 差异不存在:[/] {discrepancy_id}")
+        console.print(f"[red]ERR[/] 差异不存在: {discrepancy_id}")
         sys.exit(1)
 
     if found.rollback():
         storage.save(batch)
-        console.print(f"[green][OK][/] 已回滚[/] {discrepancy_id}，当前状态: [bold]{found.status.value}[/]")
+        console.print(f"[green]OK[/] 已回滚 {discrepancy_id}，当前状态: [bold]{found.status.value}[/]")
     else:
-        console.print(f"[yellow][WARN][/] 无可回滚的历史记录[/]")
+        console.print(f"[yellow]WARN[/] 无可回滚的历史记录")
 
 
 # ── view (resume) ─────────────────────────────────────────
@@ -344,7 +344,7 @@ def resume(batch_id: str) -> None:
     """恢复批次 - 显示批次详情，确认状态完整保留."""
     storage = _get_storage()
     if not storage.batch_exists(batch_id):
-        console.print(f"[red][ERR][/] 批次不存在:[/] {batch_id}")
+        console.print(f"[red]ERR[/] 批次不存在: {batch_id}")
         sys.exit(1)
 
     batch = storage.load(batch_id)
@@ -412,7 +412,7 @@ def resume(batch_id: str) -> None:
 def export(batch_id: str, output: str, status: Optional[str], disp_type: Optional[str], with_summary: bool) -> None:
     storage = _get_storage()
     if not storage.batch_exists(batch_id):
-        console.print(f"[red][ERR][/] 批次不存在:[/] {batch_id}")
+        console.print(f"[red]ERR[/] 批次不存在: {batch_id}")
         sys.exit(1)
 
     batch = storage.load(batch_id)
@@ -423,13 +423,13 @@ def export(batch_id: str, output: str, status: Optional[str], disp_type: Optiona
     count = export_discrepancies_csv(batch, output, status_filter, type_filter)
     storage.record_export(batch, output, "discrepancies")
 
-    console.print(f"[green][OK][/] 已导出[/] {count} 条差异到 [cyan]{output}[/]")
+    console.print(f"[green]OK[/] 已导出 {count} 条差异到 [cyan]{output}[/]")
 
     if with_summary:
         base, ext = os.path.splitext(output)
         summary_path = f"{base}_summary{ext}"
         export_summary_csv(batch, summary_path)
-        console.print(f"[green][OK][/] 摘要已导出到[/] [cyan]{summary_path}[/]")
+        console.print(f"[green]OK[/] 摘要已导出到 [cyan]{summary_path}[/]")
 
 
 def main() -> None:

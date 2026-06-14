@@ -1,28 +1,28 @@
 {
-  "batch_id": "BATCH-ECC94E03",
-  "name": "2024年1月对账",
-  "created_at": "2026-06-14T11:47:05.015557",
-  "updated_at": "2026-06-14T11:49:24.359326",
+  "batch_id": "BATCH-D4C021A1",
+  "name": "测试批次2024",
+  "created_at": "2026-06-14T12:34:30.889970",
+  "updated_at": "2026-06-14T12:35:08.939180",
   "rule_file": "D:\\workSpace\\AI__SPACE\\zzz-00049\\samples\\rules.yaml",
   "imported_files": [
     {
       "file_type": "bank_statement",
       "file_path": "D:\\workSpace\\AI__SPACE\\zzz-00049\\samples\\bank_statement.csv",
-      "imported_at": "2026-06-14T11:47:08.908092",
+      "imported_at": "2026-06-14T12:34:38.034025",
       "row_count": 10,
-      "error_count": 2
+      "error_count": 3
     },
     {
       "file_type": "system_receipt",
       "file_path": "D:\\workSpace\\AI__SPACE\\zzz-00049\\samples\\system_receipt.csv",
-      "imported_at": "2026-06-14T11:48:08.110690",
+      "imported_at": "2026-06-14T12:34:43.508142",
       "row_count": 11,
       "error_count": 0
     },
     {
       "file_type": "manual_adjustment",
       "file_path": "D:\\workSpace\\AI__SPACE\\zzz-00049\\samples\\manual_adjustment.csv",
-      "imported_at": "2026-06-14T11:48:20.904647",
+      "imported_at": "2026-06-14T12:34:43.879715",
       "row_count": 2,
       "error_count": 0
     }
@@ -472,15 +472,15 @@
   ],
   "discrepancies": [
     {
-      "discrepancy_id": "DISP-D166C5FBFD",
+      "discrepancy_id": "DISP-8882CE79ED",
       "discrepancy_type": "duplicate",
       "status": "open",
       "message": "银行回单中存在重复流水号 B002, 首笔金额 3200.5, 本笔金额 3200.5, 首笔行号 3, 本笔行号 10",
       "reviewer": null,
       "note": "",
       "rollback_history": [],
-      "created_at": "2026-06-14T11:48:40.228420",
-      "updated_at": "2026-06-14T11:49:13.351452",
+      "created_at": "2026-06-14T12:34:48.951985",
+      "updated_at": "2026-06-14T12:35:08.939180",
       "bank_txn": {
         "txn_id": "B002",
         "amount": 3200.5,
@@ -504,15 +504,15 @@
       "adjustment_txn": null
     },
     {
-      "discrepancy_id": "DISP-83B070F816",
+      "discrepancy_id": "DISP-849542B411",
       "discrepancy_type": "needs_manual_review",
       "status": "open",
       "message": "摘要包含待人工确认关键词，银行: '手续费' / 系统: '手续费'",
       "reviewer": null,
       "note": "",
       "rollback_history": [],
-      "created_at": "2026-06-14T11:48:40.228420",
-      "updated_at": "2026-06-14T11:48:40.228420",
+      "created_at": "2026-06-14T12:34:48.951985",
+      "updated_at": "2026-06-14T12:34:48.951985",
       "bank_txn": {
         "txn_id": "B004",
         "amount": 890.0,
@@ -554,15 +554,15 @@
       "adjustment_txn": null
     },
     {
-      "discrepancy_id": "DISP-0889CFD8C0",
+      "discrepancy_id": "DISP-AE11CE51D4",
       "discrepancy_type": "needs_manual_review",
       "status": "open",
       "message": "摘要包含待人工确认关键词，银行: '待确认收入' / 系统: '待确认'",
       "reviewer": null,
       "note": "",
       "rollback_history": [],
-      "created_at": "2026-06-14T11:48:40.228420",
-      "updated_at": "2026-06-14T11:48:40.228420",
+      "created_at": "2026-06-14T12:34:48.951985",
+      "updated_at": "2026-06-14T12:34:48.951985",
       "bank_txn": {
         "txn_id": "B006",
         "amount": 1200.0,
@@ -604,15 +604,15 @@
       "adjustment_txn": null
     },
     {
-      "discrepancy_id": "DISP-361DA1C1E5",
+      "discrepancy_id": "DISP-214D3175BF",
       "discrepancy_type": "missing_in_system",
       "status": "open",
       "message": "银行有此流水 B007 (金额 750.0)，但系统无记录",
       "reviewer": null,
       "note": "",
       "rollback_history": [],
-      "created_at": "2026-06-14T11:48:40.228420",
-      "updated_at": "2026-06-14T11:48:40.228420",
+      "created_at": "2026-06-14T12:34:48.951985",
+      "updated_at": "2026-06-14T12:34:48.951985",
       "bank_txn": {
         "txn_id": "B007",
         "amount": 750.0,
@@ -636,15 +636,15 @@
       "adjustment_txn": null
     },
     {
-      "discrepancy_id": "DISP-836474855B",
+      "discrepancy_id": "DISP-917E921512",
       "discrepancy_type": "needs_manual_review",
       "status": "open",
       "message": "摘要包含待人工确认关键词，银行: '退款' / 系统: '退款处理'",
       "reviewer": null,
       "note": "",
       "rollback_history": [],
-      "created_at": "2026-06-14T11:48:40.228420",
-      "updated_at": "2026-06-14T11:48:40.228420",
+      "created_at": "2026-06-14T12:34:48.951985",
+      "updated_at": "2026-06-14T12:34:48.951985",
       "bank_txn": {
         "txn_id": "B008",
         "amount": 3300.0,
@@ -686,15 +686,15 @@
       "adjustment_txn": null
     },
     {
-      "discrepancy_id": "DISP-B6E3ADCC6B",
+      "discrepancy_id": "DISP-1049D2C660",
       "discrepancy_type": "needs_manual_review",
       "status": "open",
       "message": "摘要包含待人工确认关键词，银行: '调账' / 系统: '调账'",
       "reviewer": null,
       "note": "",
       "rollback_history": [],
-      "created_at": "2026-06-14T11:48:40.228420",
-      "updated_at": "2026-06-14T11:48:40.228420",
+      "created_at": "2026-06-14T12:34:48.951985",
+      "updated_at": "2026-06-14T12:34:48.951985",
       "bank_txn": {
         "txn_id": "B011",
         "amount": 2100.0,
@@ -736,15 +736,15 @@
       "adjustment_txn": null
     },
     {
-      "discrepancy_id": "DISP-A81FB8BC1F",
+      "discrepancy_id": "DISP-A28DE7269D",
       "discrepancy_type": "missing_in_bank",
       "status": "open",
       "message": "系统有此流水 B009 (金额 4300.0)，但银行无记录",
       "reviewer": null,
       "note": "",
       "rollback_history": [],
-      "created_at": "2026-06-14T11:48:40.228420",
-      "updated_at": "2026-06-14T11:48:40.228420",
+      "created_at": "2026-06-14T12:34:48.951985",
+      "updated_at": "2026-06-14T12:34:48.951985",
       "bank_txn": null,
       "system_txn": {
         "txn_id": "B009",
@@ -768,15 +768,15 @@
       "adjustment_txn": null
     },
     {
-      "discrepancy_id": "DISP-1AA6FE760E",
+      "discrepancy_id": "DISP-E9DCC104A1",
       "discrepancy_type": "missing_in_bank",
       "status": "open",
       "message": "系统有此流水 B010 (金额 1800.0)，但银行无记录",
       "reviewer": null,
       "note": "",
       "rollback_history": [],
-      "created_at": "2026-06-14T11:48:40.228420",
-      "updated_at": "2026-06-14T11:48:40.228420",
+      "created_at": "2026-06-14T12:34:48.951985",
+      "updated_at": "2026-06-14T12:34:48.951985",
       "bank_txn": null,
       "system_txn": {
         "txn_id": "B010",
@@ -800,15 +800,15 @@
       "adjustment_txn": null
     },
     {
-      "discrepancy_id": "DISP-FED92E38D3",
+      "discrepancy_id": "DISP-528A337787",
       "discrepancy_type": "missing_in_bank",
       "status": "open",
       "message": "系统有此流水 B012 (金额 6700.0)，但银行无记录",
       "reviewer": null,
       "note": "",
       "rollback_history": [],
-      "created_at": "2026-06-14T11:48:40.228420",
-      "updated_at": "2026-06-14T11:48:40.228420",
+      "created_at": "2026-06-14T12:34:48.951985",
+      "updated_at": "2026-06-14T12:34:48.951985",
       "bank_txn": null,
       "system_txn": {
         "txn_id": "B012",
@@ -835,8 +835,8 @@
   "exports": [
     {
       "export_type": "discrepancies",
-      "file_path": "D:\\workSpace\\AI__SPACE\\zzz-00049\\report\\test_export.csv",
-      "exported_at": "2026-06-14T11:49:24.359326",
+      "file_path": "D:\\workSpace\\AI__SPACE\\zzz-00049\\test_report.csv",
+      "exported_at": "2026-06-14T12:34:56.587733",
       "discrepancy_count": 9
     }
   ]

@@ -133,6 +133,8 @@ def parse_csv(
         file_path=os.path.abspath(file_path),
     )
 
+    seen_ids: Dict[str, int] = {}
+
     with open(file_path, "r", encoding=encoding, newline="") as f:
         reader = csv.DictReader(f)
         if not reader.fieldnames:
@@ -184,6 +186,16 @@ def parse_csv(
                 currency=(row.get(col_map["currency"], "CNY") if "currency" in col_map else "CNY").strip() or "CNY",
                 raw_data=raw_row,
             )
+            if raw_txn_id in seen_ids:
+                result.duplicates.append(ParseError(
+                    source_file=file_path,
+                    source_row=idx,
+                    error_type="duplicate_txn_id",
+                    message=f"重复流水号 {raw_txn_id}, 首次出现于第 {seen_ids[raw_txn_id]} 行",
+                    raw_row=raw_row,
+                ))
+            else:
+                seen_ids[raw_txn_id] = idx
             result.transactions.append(txn)
 
     imported_file.row_count = result.row_count
